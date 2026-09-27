@@ -47,6 +47,9 @@ import os
 import time
 import logging
 
+import threading
+from copy import deepcopy
+
 from dataclasses import dataclass
 from typing import (
     List,
@@ -180,9 +183,15 @@ GEMINI_GENERATION_MODELS = [
 # GROQ FINAL FALLBACK
 # ------------------------------------------------------------
 
-GROQ_FALLBACK_MODEL = (
-    "openai/gpt-oss-120b"
+GROQ_GENERATION_MODELS = (
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b"
 )
+
+
+CIRCUIT_BREAKER_SECONDS = 120
+QUOTA_CIRCUIT_BREAKER_SECONDS = 1800
 
 
 # ------------------------------------------------------------
@@ -190,7 +199,7 @@ GROQ_FALLBACK_MODEL = (
 # ------------------------------------------------------------
 
 COLLECTION_NAME = (
-    "acme_employee_policies"
+    "acme_employee_policies_v2"
 )
 
 
@@ -199,6 +208,25 @@ COLLECTION_NAME = (
 # ------------------------------------------------------------
 
 TOP_K = 10
+
+
+# ============================================================
+# RAG CACHE CONFIGURATION
+# ============================================================
+
+# Cache complete RAG responses for 10 minutes.
+#
+# This is intentionally an in-memory cache for now:
+#
+# - zero infrastructure
+# - very fast
+# - good for one Render instance
+#
+# Later, Redis can replace this without changing the RAG flow.
+
+CACHE_TTL_SECONDS = 600
+
+CACHE_MAX_ENTRIES = 500
 
 
 # ============================================================
@@ -694,6 +722,128 @@ Content:
         )
 
 
+
+
+
+# ============================================================
+# MODEL CIRCUIT BREAKER
+# ============================================================
+
+class ModelCircuitBreaker:
+
+    """
+    Thread-safe per-model circuit breaker.
+
+    Example:
+
+        gemini-3.8
+             ↓
+            429
+             ↓
+        circuit OPEN
+             ↓
+        future requests skip 3.8 temporarily
+
+    Each model has its own independent circuit.
+    """
+
+    def __init__(self):
+
+        self._open_until = {}
+
+        self._lock = threading.Lock()
+
+
+    def is_available(
+        self,
+        model: str,
+    ) -> bool:
+
+        with self._lock:
+
+            open_until = self._open_until.get(
+                model
+            )
+
+
+            if open_until is None:
+
+                return True
+
+
+            if time.time() >= open_until:
+
+                self._open_until.pop(
+                    model,
+                    None,
+                )
+
+                logger.info(
+                    "CIRCUIT_CLOSED | model=%s",
+                    model,
+                )
+
+                return True
+
+
+            return False
+
+
+    def open(
+        self,
+        model: str,
+        seconds: int,
+        reason: str,
+    ):
+
+        with self._lock:
+
+            self._open_until[
+                model
+            ] = (
+                time.time()
+                + seconds
+            )
+
+
+        logger.warning(
+            "CIRCUIT_OPEN | "
+            "model=%s | "
+            "seconds=%d | "
+            "reason=%s",
+            model,
+            seconds,
+            reason,
+        )
+
+
+    def remaining_seconds(
+        self,
+        model: str,
+    ) -> int:
+
+        with self._lock:
+
+            open_until = self._open_until.get(
+                model
+            )
+
+
+            if open_until is None:
+
+                return 0
+
+
+            return max(
+                0,
+                int(
+                    open_until
+                    - time.time()
+                ),
+            )
+
+
+
 # ============================================================
 # GEMINI GENERATION SERVICE
 # ============================================================
@@ -701,62 +851,50 @@ Content:
 class GeminiGenerationService:
 
     """
-    Gemini generation service.
+    Gemini primary generation service.
 
-    Attempts Gemini models sequentially.
+    Important behavior:
 
-    Example:
+    NORMAL:
+        try Gemini models in priority order.
 
-        Gemini model A
-             |
-            503
-             |
-           retry
-             |
-            503
-             |
-        Gemini model B
-             |
-           success
+    QUOTA EXHAUSTED:
+        open circuit for that model.
 
-    IMPORTANT:
+    TEMPORARY FAILURE:
+        open shorter circuit.
 
-    This service returns:
+    OPEN CIRCUIT:
+        skip model immediately.
 
-        {
-            "answer": "...",
-            "provider": "gemini",
-            "model": "..."
-        }
-
-    This is what fixes the missing provider/model metadata.
+    This prevents every user request from repeatedly waiting
+    for models that we already know are unavailable.
     """
 
     def __init__(
         self,
         client,
         models: List[str],
-        retries_per_model: int = 2,
-        initial_retry_delay: float = 1.5,
+        circuit_breaker: ModelCircuitBreaker,
     ):
 
         self.client = client
 
         self.models = models
 
-        self.retries_per_model = (
-            retries_per_model
+        self.circuit_breaker = (
+            circuit_breaker
         )
 
-        self.initial_retry_delay = (
-            initial_retry_delay
-        )
 
+    # ========================================================
+    # STATUS CODE
+    # ========================================================
 
     @staticmethod
-    def _is_retryable(
+    def _get_status_code(
         error: Exception,
-    ) -> bool:
+    ):
 
         status_code = getattr(
             error,
@@ -765,30 +903,92 @@ class GeminiGenerationService:
         )
 
 
-        return status_code in {
+        if status_code:
 
-            429,
-            500,
-            502,
-            503,
-            504,
+            return status_code
 
-        }
 
+        # google-genai exceptions do not always expose
+        # status_code consistently, as your logs demonstrated.
+
+        text = str(
+            error
+        ).upper()
+
+
+        if (
+            "429"
+            in text
+            or "RESOURCE_EXHAUSTED"
+            in text
+        ):
+
+            return 429
+
+
+        if (
+            "503"
+            in text
+            or "UNAVAILABLE"
+            in text
+        ):
+
+            return 503
+
+
+        if "500" in text:
+
+            return 500
+
+
+        if "502" in text:
+
+            return 502
+
+
+        if "504" in text:
+
+            return 504
+
+
+        return None
+
+
+    # ========================================================
+    # QUOTA FAILURE
+    # ========================================================
+
+    @staticmethod
+    def _is_quota_failure(
+        error: Exception,
+    ) -> bool:
+
+        text = str(
+            error
+        ).lower()
+
+
+        return (
+            "resource_exhausted"
+            in text
+
+            or "quota exceeded"
+            in text
+
+            or "free_tier_requests"
+            in text
+        )
+
+
+    # ========================================================
+    # SINGLE MODEL
+    # ========================================================
 
     def _generate_with_model(
         self,
         model: str,
         prompt: str,
     ) -> str:
-
-        """
-        Generate using Gemini.
-
-        Keeping generate_content here means this remains
-        compatible with the Gemini setup you already have
-        working locally.
-        """
 
         response = (
             self.client.models
@@ -801,9 +1001,7 @@ class GeminiGenerationService:
         )
 
 
-        answer = (
-            response.text
-        )
+        answer = response.text
 
 
         if not answer:
@@ -817,6 +1015,10 @@ class GeminiGenerationService:
         return answer
 
 
+    # ========================================================
+    # GENERATE
+    # ========================================================
+
     def generate(
         self,
         question: str,
@@ -831,179 +1033,190 @@ class GeminiGenerationService:
         )
 
 
-        last_error = None
+        attempted_models = []
 
-
-        # ====================================================
-        # TRY EACH GEMINI MODEL
-        # ====================================================
 
         for model in self.models:
 
-
             # =================================================
-            # RETRIES FOR CURRENT MODEL
+            # CIRCUIT CHECK
             # =================================================
 
-            for attempt in range(
-                1,
-                self.retries_per_model + 1,
+            if not self.circuit_breaker.is_available(
+                model
             ):
 
-                try:
-
-                    logger.info(
-                        "Generation attempt | "
-                        "provider=gemini | "
-                        "model=%s | "
-                        "attempt=%d/%d",
-                        model,
-                        attempt,
-                        self.retries_per_model,
+                remaining = (
+                    self.circuit_breaker
+                    .remaining_seconds(
+                        model
                     )
+                )
 
 
-                    answer = (
-                        self._generate_with_model(
-
-                            model=model,
-
-                            prompt=prompt,
-                        )
-                    )
-
-
-                    logger.info(
-                        "Generation successful | "
-                        "provider=gemini | "
-                        "model=%s",
-                        model,
-                    )
+                logger.info(
+                    "GENERATION_MODEL_SKIPPED | "
+                    "provider=gemini | "
+                    "model=%s | "
+                    "circuit_open=true | "
+                    "remaining_seconds=%d",
+                    model,
+                    remaining,
+                )
 
 
-                    # ========================================
-                    # IMPORTANT FIX
-                    #
-                    # Return answer + provider + actual model.
-                    # ========================================
-
-                    return {
-
-                        "answer":
-                            answer,
-
-                        "provider":
-                            "gemini",
-
-                        "model":
-                            model,
-                    }
+                continue
 
 
-                except Exception as error:
-
-                    last_error = error
-
-
-                    status_code = getattr(
-                        error,
-                        "status_code",
-                        None,
-                    )
+            attempted_models.append(
+                model
+            )
 
 
-                    # ========================================
-                    # NON-RETRYABLE ERROR
-                    # ========================================
-
-                    if not self._is_retryable(
-                        error
-                    ):
-
-                        logger.warning(
-                            "Gemini model failed with "
-                            "non-retryable error | "
-                            "model=%s | "
-                            "status=%s | "
-                            "error=%s",
-                            model,
-                            status_code,
-                            error,
-                        )
-
-
-                        break
-
-
-                    # ========================================
-                    # RETRYABLE ERROR
-                    # ========================================
-
-                    logger.warning(
-                        "Temporary Gemini failure | "
-                        "model=%s | "
-                        "status=%s | "
-                        "attempt=%d/%d",
-                        model,
-                        status_code,
-                        attempt,
-                        self.retries_per_model,
-                    )
-
-
-                    if (
-                        attempt
-                        < self.retries_per_model
-                    ):
-
-                        delay = (
-
-                            self.initial_retry_delay
-
-                            * (
-
-                                2
-
-                                ** (
-                                    attempt - 1
-                                )
-                            )
-                        )
-
-
-                        logger.info(
-                            "Retrying %s "
-                            "in %.1f seconds",
-                            model,
-                            delay,
-                        )
-
-
-                        time.sleep(
-                            delay
-                        )
-
-
-            # =================================================
-            # CURRENT MODEL FAILED
-            # =================================================
-
-            logger.warning(
-                "Moving to next Gemini model | "
-                "failed_model=%s",
+            logger.info(
+                "GENERATION_ATTEMPT | "
+                "provider=gemini | "
+                "model=%s",
                 model,
             )
 
 
-        # ====================================================
-        # ALL GEMINI MODELS FAILED
-        # ====================================================
+            try:
+
+                answer = (
+                    self._generate_with_model(
+
+                        model=model,
+
+                        prompt=prompt,
+                    )
+                )
+
+
+                logger.info(
+                    "GENERATION_SUCCESS | "
+                    "provider=gemini | "
+                    "model=%s",
+                    model,
+                )
+
+
+                return {
+
+                    "answer":
+                        answer,
+
+                    "provider":
+                        "gemini",
+
+                    "model":
+                        model,
+                }
+
+
+            except Exception as error:
+
+                status_code = (
+                    self._get_status_code(
+                        error
+                    )
+                )
+
+
+                # =================================================
+                # QUOTA EXHAUSTED
+                # =================================================
+
+                if self._is_quota_failure(
+                    error
+                ):
+
+                    self.circuit_breaker.open(
+
+                        model=model,
+
+                        seconds=
+                            QUOTA_CIRCUIT_BREAKER_SECONDS,
+
+                        reason=
+                            "quota_exhausted",
+                    )
+
+
+                    logger.warning(
+                        "GEMINI_QUOTA_EXHAUSTED | "
+                        "model=%s | "
+                        "moving_to_next_model",
+                        model,
+                    )
+
+
+                    continue
+
+
+                # =================================================
+                # TEMPORARY SERVICE FAILURE
+                # =================================================
+
+                if status_code in {
+
+                    500,
+                    502,
+                    503,
+                    504,
+
+                }:
+
+                    self.circuit_breaker.open(
+
+                        model=model,
+
+                        seconds=
+                            CIRCUIT_BREAKER_SECONDS,
+
+                        reason=
+                            f"http_{status_code}",
+                    )
+
+
+                    logger.warning(
+                        "GEMINI_TEMPORARY_FAILURE | "
+                        "model=%s | "
+                        "status=%s",
+                        model,
+                        status_code,
+                    )
+
+
+                    continue
+
+
+                # =================================================
+                # OTHER MODEL FAILURE
+                #
+                # Don't make the entire service unavailable merely
+                # because one configured model rejected a request.
+                # =================================================
+
+                logger.warning(
+                    "GEMINI_MODEL_FAILURE | "
+                    "model=%s | "
+                    "status=%s | "
+                    "error=%s",
+                    model,
+                    status_code,
+                    error,
+                )
+
+
+                continue
+
 
         raise RuntimeError(
-            "All configured Gemini "
-            "generation models failed."
-        ) from last_error
 
+            "No Gemini generation model was available. "
+            f"Attempted={attempted_models}"
+        )
 
 # ============================================================
 # GROQ GENERATION SERVICE
@@ -1012,27 +1225,78 @@ class GeminiGenerationService:
 class GroqGenerationService:
 
     """
-    Final cross-provider fallback.
+    Multi-model Groq fallback chain.
 
-    Used only if the complete Gemini chain fails.
+    Priority:
 
-    IMPORTANT:
+        GPT-OSS 120B
+              ↓
+        Qwen 3.8 27B
+              ↓
+        GPT-OSS 20B
 
-    Returns the SAME dictionary structure as Gemini.
+    Every model also has circuit-breaker protection.
     """
 
     def __init__(
         self,
         client: Groq,
-        model: str,
-        retries: int = 2,
+        models: List[str],
+        circuit_breaker: ModelCircuitBreaker,
     ):
 
         self.client = client
 
-        self.model = model
+        self.models = models
 
-        self.retries = retries
+        self.circuit_breaker = (
+            circuit_breaker
+        )
+
+
+    @staticmethod
+    def _status_code(
+        error: Exception,
+    ):
+
+        status_code = getattr(
+            error,
+            "status_code",
+            None,
+        )
+
+
+        if status_code:
+
+            return status_code
+
+
+        text = str(
+            error
+        )
+
+
+        if "429" in text:
+
+            return 429
+
+
+        if "503" in text:
+
+            return 503
+
+
+        if "502" in text:
+
+            return 502
+
+
+        if "500" in text:
+
+            return 500
+
+
+        return None
 
 
     def generate(
@@ -1052,23 +1316,37 @@ class GroqGenerationService:
         last_error = None
 
 
-        for attempt in range(
-            1,
-            self.retries + 1,
-        ):
+        for model in self.models:
 
-            try:
+            # =================================================
+            # CIRCUIT CHECK
+            # =================================================
+
+            if not self.circuit_breaker.is_available(
+                model
+            ):
 
                 logger.info(
-                    "Generation attempt | "
+                    "GENERATION_MODEL_SKIPPED | "
                     "provider=groq | "
                     "model=%s | "
-                    "attempt=%d/%d",
-                    self.model,
-                    attempt,
-                    self.retries,
+                    "circuit_open=true",
+                    model,
                 )
 
+
+                continue
+
+
+            logger.info(
+                "GENERATION_ATTEMPT | "
+                "provider=groq | "
+                "model=%s",
+                model,
+            )
+
+
+            try:
 
                 response = (
                     self.client
@@ -1077,7 +1355,7 @@ class GroqGenerationService:
                     .create(
 
                         model=
-                            self.model,
+                            model,
 
                         messages=[
 
@@ -1098,6 +1376,7 @@ class GroqGenerationService:
 
 
                 answer = (
+
                     response
                     .choices[0]
                     .message
@@ -1108,24 +1387,18 @@ class GroqGenerationService:
                 if not answer:
 
                     raise RuntimeError(
-                        "Groq returned "
-                        "an empty response."
+                        f"Groq model {model} "
+                        f"returned an empty response."
                     )
 
 
                 logger.info(
-                    "Generation successful | "
+                    "GENERATION_SUCCESS | "
                     "provider=groq | "
                     "model=%s",
-                    self.model,
+                    model,
                 )
 
-
-                # ============================================
-                # IMPORTANT FIX
-                #
-                # Same response contract as Gemini.
-                # ============================================
 
                 return {
 
@@ -1136,7 +1409,7 @@ class GroqGenerationService:
                         "groq",
 
                     "model":
-                        self.model,
+                        model,
                 }
 
 
@@ -1145,39 +1418,74 @@ class GroqGenerationService:
                 last_error = error
 
 
+                status_code = (
+                    self._status_code(
+                        error
+                    )
+                )
+
+
+                # =================================================
+                # RATE LIMIT
+                # =================================================
+
+                if status_code == 429:
+
+                    self.circuit_breaker.open(
+
+                        model=model,
+
+                        seconds=
+                            CIRCUIT_BREAKER_SECONDS,
+
+                        reason=
+                            "rate_limit",
+                    )
+
+
+                # =================================================
+                # TEMPORARY SERVICE FAILURE
+                # =================================================
+
+                elif status_code in {
+
+                    500,
+                    502,
+                    503,
+
+                }:
+
+                    self.circuit_breaker.open(
+
+                        model=model,
+
+                        seconds=
+                            CIRCUIT_BREAKER_SECONDS,
+
+                        reason=
+                            f"http_{status_code}",
+                    )
+
+
                 logger.warning(
-                    "Groq generation failed | "
+                    "GROQ_MODEL_FAILURE | "
                     "model=%s | "
-                    "attempt=%d/%d | "
+                    "status=%s | "
                     "error=%s",
-                    self.model,
-                    attempt,
-                    self.retries,
+                    model,
+                    status_code,
                     error,
                 )
 
 
-                if attempt < self.retries:
+                # Immediately try next Groq model.
 
-                    delay = (
-                        1.5
-                        * (
-                            2
-                            ** (attempt - 1)
-                        )
-                    )
-
-
-                    time.sleep(
-                        delay
-                    )
+                continue
 
 
         raise RuntimeError(
-            "Groq generation failed "
-            "after all retries."
+            "All Groq generation models failed."
         ) from last_error
-
 
 # ============================================================
 # GENERATION ROUTER
@@ -1186,23 +1494,26 @@ class GroqGenerationService:
 class GenerationRouter:
 
     """
-    Cross-provider router.
+    Provider-level generation routing.
 
     Flow:
 
-        Gemini models
+        Gemini chain
              |
-        all fail
+          success
+             |
+           answer
+
+    OR
+
+        Gemini unavailable
              |
              v
-           Groq
-
-    IMPORTANT:
-
-    The entire result dictionary is returned.
-
-    We do NOT return only result["answer"] because that would
-    discard provider/model metadata.
+        Groq chain
+             |
+          success
+             |
+           answer
     """
 
     def __init__(
@@ -1229,12 +1540,12 @@ class GenerationRouter:
     ) -> Dict[str, str]:
 
         # ====================================================
-        # PRIMARY: GEMINI
+        # PRIMARY PROVIDER
         # ====================================================
 
         try:
 
-            result = (
+            return (
                 self.gemini_generator
                 .generate(
 
@@ -1245,58 +1556,195 @@ class GenerationRouter:
             )
 
 
-            # IMPORTANT:
-            #
-            # Return entire result.
-            #
-            # NOT:
-            #
-            # return result["answer"]
-
-            return result
-
-
-        except Exception as gemini_error:
+        except Exception as error:
 
             logger.warning(
-                "Gemini generation chain failed. "
-                "Switching to Groq | "
-                "error=%s",
-                gemini_error,
+                "GENERATION_PROVIDER_FALLBACK | "
+                "from=gemini | "
+                "to=groq | "
+                "reason=%s",
+                error,
             )
 
 
         # ====================================================
-        # FALLBACK: GROQ
+        # SECONDARY PROVIDER
         # ====================================================
 
-        try:
+        return (
+            self.groq_generator
+            .generate(
 
-            result = (
-                self.groq_generator
-                .generate(
+                question=question,
 
-                    question=question,
+                context=context,
+            )
+        )
 
-                    context=context,
+
+# ============================================================
+# TTL RESPONSE CACHE
+# ============================================================
+
+class TTLResponseCache:
+
+    """
+    Small thread-safe in-memory TTL cache.
+
+    Cache key:
+
+        normalized question + top_k
+
+    Cache value:
+
+        complete RAG result
+
+    IMPORTANT:
+
+    This cache lives inside the application process.
+
+    Therefore:
+
+    - restarting Render clears it
+    - multiple replicas would have separate caches
+
+    That's acceptable for the current architecture.
+    Redis would be the distributed replacement later.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: int = CACHE_TTL_SECONDS,
+        max_entries: int = CACHE_MAX_ENTRIES,
+    ):
+
+        self.ttl_seconds = ttl_seconds
+
+        self.max_entries = max_entries
+
+        self._cache = {}
+
+        self._lock = threading.Lock()
+
+
+    def _remove_expired(self):
+
+        now = time.time()
+
+        expired_keys = [
+
+            key
+
+            for key, item
+            in self._cache.items()
+
+            if (
+                now
+                - item["created_at"]
+                > self.ttl_seconds
+            )
+        ]
+
+
+        for key in expired_keys:
+
+            self._cache.pop(
+                key,
+                None,
+            )
+
+
+    def get(
+        self,
+        key: str,
+    ):
+
+        with self._lock:
+
+            self._remove_expired()
+
+
+            item = self._cache.get(
+                key
+            )
+
+
+            if item is None:
+
+                return None
+
+
+            # Return a copy so callers cannot mutate
+            # the cached object.
+
+            return deepcopy(
+                item["value"]
+            )
+
+
+    def set(
+        self,
+        key: str,
+        value,
+    ):
+
+        with self._lock:
+
+            self._remove_expired()
+
+
+            # Simple oldest-entry eviction.
+
+            if (
+                len(self._cache)
+                >= self.max_entries
+            ):
+
+                oldest_key = min(
+
+                    self._cache,
+
+                    key=lambda item_key:
+                        self._cache[
+                            item_key
+                        ][
+                            "created_at"
+                        ],
                 )
+
+
+                self._cache.pop(
+                    oldest_key,
+                    None,
+                )
+
+
+            self._cache[key] = {
+
+                "created_at":
+                    time.time(),
+
+                "value":
+                    deepcopy(value),
+            }
+
+
+    def clear(self):
+
+        with self._lock:
+
+            self._cache.clear()
+
+
+    def size(self):
+
+        with self._lock:
+
+            self._remove_expired()
+
+            return len(
+                self._cache
             )
-
-
-            return result
-
-
-        except Exception as groq_error:
-
-            logger.exception(
-                "All generation providers failed."
-            )
-
-
-            raise RuntimeError(
-                "Unable to generate an answer because "
-                "all configured generation providers failed."
-            ) from groq_error
 
 
 # ============================================================
@@ -1306,31 +1754,55 @@ class GenerationRouter:
 class EnterpriseRAG:
 
     """
-    Main RAG application service.
+    Main Enterprise RAG service.
 
-    Used by:
-
-        FastAPI
-        CLI
-        Streamlit (if desired)
-
-    Flow:
+    Pipeline:
 
         question
            |
-        retrieve
+           v
+        cache
+         / \\
+      hit   miss
+       |      |
+       |   embedding
+       |      |
+       |    Qdrant
+       |      |
+       |    context
+       |      |
+       |   generation
+       |      |
+       +------+
            |
-        context
-           |
-        generation router
-           |
-        answer + metadata + sources
+         answer
+
+
+    Timings captured:
+
+        retrieval_ms
+            |
+            | includes:
+            | query embedding
+            | +
+            | Qdrant search
+
+        context_ms
+
+        generation_ms
+
+        total_ms
+
+
+    More detailed embedding/Qdrant timings can be added later
+    inside Retriever if necessary.
     """
 
     def __init__(
         self,
         retriever: Retriever,
         generator: GenerationRouter,
+        cache: Optional[TTLResponseCache] = None,
     ):
 
         self.retriever = (
@@ -1341,12 +1813,69 @@ class EnterpriseRAG:
             generator
         )
 
+        self.cache = (
+
+            cache
+
+            if cache is not None
+
+            else TTLResponseCache()
+        )
+
+
+    # ========================================================
+    # CACHE KEY
+    # ========================================================
+
+    @staticmethod
+    def _build_cache_key(
+        question: str,
+        top_k: int,
+    ) -> str:
+
+        """
+        Normalize superficial question differences.
+
+        Example:
+
+            "What is leave policy?"
+
+        and:
+
+            "  WHAT IS LEAVE POLICY?  "
+
+        become the same cache key.
+        """
+
+        normalized_question = " ".join(
+
+            question
+            .lower()
+            .strip()
+            .split()
+        )
+
+
+        return (
+            f"{top_k}:"
+            f"{normalized_question}"
+        )
+
+
+    # ========================================================
+    # ASK
+    # ========================================================
 
     def ask(
         self,
         question: str,
         top_k: Optional[int] = None,
     ) -> Dict[str, Any]:
+
+        total_started = (
+            time.perf_counter()
+        )
+
 
         question = (
             question.strip()
@@ -1360,30 +1889,174 @@ class EnterpriseRAG:
             )
 
 
-        logger.info(
-            "RAG request started | "
-            "question=%s",
-            question,
+        effective_top_k = (
+
+            top_k
+
+            if top_k is not None
+
+            else self.retriever.default_top_k
+        )
+
+
+        cache_key = (
+            self._build_cache_key(
+
+                question=
+                    question,
+
+                top_k=
+                    effective_top_k,
+            )
         )
 
 
         # ====================================================
-        # 1. RETRIEVAL
+        # 1. CACHE LOOKUP
         # ====================================================
+
+        cache_started = (
+            time.perf_counter()
+        )
+
+
+        cached_result = (
+            self.cache.get(
+                cache_key
+            )
+        )
+
+
+        cache_lookup_ms = (
+
+            time.perf_counter()
+            - cache_started
+
+        ) * 1000
+
+
+        # ====================================================
+        # CACHE HIT
+        # ====================================================
+
+        if cached_result is not None:
+
+            total_ms = (
+
+                time.perf_counter()
+                - total_started
+
+            ) * 1000
+
+
+            cached_result[
+                "cache_hit"
+            ] = True
+
+
+            cached_result[
+                "timings"
+            ] = {
+
+                "cache_lookup_ms":
+                    round(
+                        cache_lookup_ms,
+                        2,
+                    ),
+
+                "retrieval_ms":
+                    0.0,
+
+                "context_ms":
+                    0.0,
+
+                "generation_ms":
+                    0.0,
+
+                "total_ms":
+                    round(
+                        total_ms,
+                        2,
+                    ),
+            }
+
+
+            logger.info(
+                "RAG_CACHE_HIT | "
+                "question=%r | "
+                "top_k=%d | "
+                "total_ms=%.2f",
+                question,
+                effective_top_k,
+                total_ms,
+            )
+
+
+            return cached_result
+
+
+        # ====================================================
+        # CACHE MISS
+        # ====================================================
+
+        logger.info(
+            "RAG_CACHE_MISS | "
+            "question=%r | "
+            "top_k=%d",
+            question,
+            effective_top_k,
+        )
+
+
+        # ====================================================
+        # 2. RETRIEVAL
+        #
+        # Includes:
+        #
+        # Gemini query embedding
+        # +
+        # Qdrant vector search
+        # ====================================================
+
+        retrieval_started = (
+            time.perf_counter()
+        )
+
 
         retrieved_chunks = (
             self.retriever.retrieve(
 
                 question=question,
 
-                top_k=top_k,
+                top_k=
+                    effective_top_k,
             )
         )
 
 
+        retrieval_ms = (
+
+            time.perf_counter()
+            - retrieval_started
+
+        ) * 1000
+
+
+        # ====================================================
+        # NO RETRIEVAL RESULTS
+        # ====================================================
+
         if not retrieved_chunks:
 
-            return {
+            total_ms = (
+
+                time.perf_counter()
+                - total_started
+
+            ) * 1000
+
+
+            result = {
 
                 "question":
                     question,
@@ -1402,12 +2075,50 @@ class EnterpriseRAG:
 
                 "sources":
                     [],
+
+                "cache_hit":
+                    False,
+
+                "timings": {
+
+                    "cache_lookup_ms":
+                        round(
+                            cache_lookup_ms,
+                            2,
+                        ),
+
+                    "retrieval_ms":
+                        round(
+                            retrieval_ms,
+                            2,
+                        ),
+
+                    "context_ms":
+                        0.0,
+
+                    "generation_ms":
+                        0.0,
+
+                    "total_ms":
+                        round(
+                            total_ms,
+                            2,
+                        ),
+                },
             }
 
 
+            return result
+
+
         # ====================================================
-        # 2. AUGMENTATION
+        # 3. CONTEXT BUILDING
         # ====================================================
+
+        context_started = (
+            time.perf_counter()
+        )
+
 
         context = (
             ContextBuilder.build(
@@ -1416,9 +2127,22 @@ class EnterpriseRAG:
         )
 
 
+        context_ms = (
+
+            time.perf_counter()
+            - context_started
+
+        ) * 1000
+
+
         # ====================================================
-        # 3. GENERATION
+        # 4. GENERATION
         # ====================================================
+
+        generation_started = (
+            time.perf_counter()
+        )
+
 
         generation_result = (
             self.generator.generate(
@@ -1430,8 +2154,16 @@ class EnterpriseRAG:
         )
 
 
+        generation_ms = (
+
+            time.perf_counter()
+            - generation_started
+
+        ) * 1000
+
+
         # ====================================================
-        # 4. BUILD SOURCE METADATA
+        # 5. SOURCE METADATA
         # ====================================================
 
         sources = []
@@ -1483,7 +2215,19 @@ class EnterpriseRAG:
 
 
         # ====================================================
-        # 5. FINAL RESULT
+        # 6. TOTAL TIMING
+        # ====================================================
+
+        total_ms = (
+
+            time.perf_counter()
+            - total_started
+
+        ) * 1000
+
+
+        # ====================================================
+        # 7. RESULT
         # ====================================================
 
         result = {
@@ -1495,10 +2239,6 @@ class EnterpriseRAG:
                 generation_result[
                     "answer"
                 ],
-
-            # ================================================
-            # IMPORTANT FIX
-            # ================================================
 
             "generation_provider":
                 generation_result[
@@ -1512,23 +2252,91 @@ class EnterpriseRAG:
 
             "sources":
                 sources,
+
+            "cache_hit":
+                False,
+
+            "timings": {
+
+                "cache_lookup_ms":
+                    round(
+                        cache_lookup_ms,
+                        2,
+                    ),
+
+                "retrieval_ms":
+                    round(
+                        retrieval_ms,
+                        2,
+                    ),
+
+                "context_ms":
+                    round(
+                        context_ms,
+                        2,
+                    ),
+
+                "generation_ms":
+                    round(
+                        generation_ms,
+                        2,
+                    ),
+
+                "total_ms":
+                    round(
+                        total_ms,
+                        2,
+                    ),
+            },
         }
 
 
+        # ====================================================
+        # 8. CACHE SUCCESSFUL RESPONSE
+        # ====================================================
+
+        self.cache.set(
+
+            key=
+                cache_key,
+
+            value=
+                result,
+        )
+
+
+        # ====================================================
+        # 9. OBSERVABILITY LOG
+        # ====================================================
+
         logger.info(
-            "RAG request completed | "
+            "RAG_TIMING | "
             "provider=%s | "
-            "model=%s",
+            "model=%s | "
+            "cache_hit=false | "
+            "retrieval_ms=%.2f | "
+            "context_ms=%.2f | "
+            "generation_ms=%.2f | "
+            "total_ms=%.2f",
             result[
                 "generation_provider"
             ],
             result[
                 "generation_model"
             ],
+            retrieval_ms,
+            context_ms,
+            generation_ms,
+            total_ms,
         )
 
 
         return result
+
+
+model_circuit_breaker = (
+    ModelCircuitBreaker()
+)
 
 
 # ============================================================
@@ -1652,18 +2460,16 @@ def create_rag() -> EnterpriseRAG:
             models=
                 GEMINI_GENERATION_MODELS,
 
-            retries_per_model=
-                2,
-
-            initial_retry_delay=
-                1.5,
+            circuit_breaker=
+                model_circuit_breaker,
         )
     )
 
+        # ========================================================
+        # GROQ GENERATION SERVICE
+        # ========================================================
 
-    # ========================================================
-    # GROQ GENERATION SERVICE
-    # ========================================================
+
 
     groq_generator = (
         GroqGenerationService(
@@ -1671,18 +2477,17 @@ def create_rag() -> EnterpriseRAG:
             client=
                 groq_client,
 
-            model=
-                GROQ_FALLBACK_MODEL,
+            models=
+                GROQ_GENERATION_MODELS,
 
-            retries=
-                2,
+            circuit_breaker=
+                model_circuit_breaker,
         )
     )
 
-
-    # ========================================================
-    # GENERATION ROUTER
-    # ========================================================
+        # ========================================================
+        # GENERATION ROUTER
+        # ========================================================
 
     generation_router = (
         GenerationRouter(

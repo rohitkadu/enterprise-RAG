@@ -5,3 +5,4 @@ qdrant-client
 python-dotenv
 streamlit
 groq
+slowapi

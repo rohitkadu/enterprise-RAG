@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY rag.py .
 COPY api.py .
 
+# Developer console
+COPY static ./static
+
 # Cloud Run sends traffic to PORT.
 ENV PORT=8080
 

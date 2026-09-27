@@ -1,14 +1,25 @@
 """
 api.py
 
-Enterprise Policy RAG
-FastAPI Backend + Built-in Developer Console
+Enterprise Policy RAG API
+
+Responsibilities:
+- FastAPI application
+- API contracts
+- Rate limiting
+- Request IDs
+- Health/readiness
+- RAG request handling
+- Operational logging
+- Developer console serving
+
+The actual RAG implementation lives in rag.py.
 
 Run locally:
 
     uvicorn api:app --host 0.0.0.0 --port 8080 --reload
 
-Open:
+Developer console:
 
     http://localhost:8080
 
@@ -21,13 +32,13 @@ Swagger:
 # IMPORTS
 # ============================================================
 
-import html
 import logging
 import time
 import uuid
 
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from pathlib import Path
+from typing import List, Optional
 
 from fastapi import (
     FastAPI,
@@ -39,7 +50,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.responses import (
-    HTMLResponse,
+    FileResponse,
     JSONResponse,
 )
 
@@ -48,7 +59,38 @@ from pydantic import (
     Field,
 )
 
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
+
 from rag import create_rag
+
+
+# ============================================================
+# APPLICATION CONSTANTS
+# ============================================================
+
+APP_NAME = "enterprise-policy-RAG"
+
+APP_VERSION = "1.1.0"
+
+API_PREFIX = "/api/v1"
+
+DEFAULT_TOP_K = 10
+
+MAX_TOP_K = 15
+
+
+# ============================================================
+# FILE PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+STATIC_DIR = BASE_DIR / "static"
+
+INDEX_FILE = STATIC_DIR / "index.html"
 
 
 # ============================================================
@@ -71,7 +113,16 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# GLOBAL APPLICATION STATE
+# RATE LIMITING
+# ============================================================
+
+limiter = Limiter(
+    key_func=get_remote_address
+)
+
+
+# ============================================================
+# APPLICATION STATE
 # ============================================================
 
 rag = None
@@ -92,7 +143,10 @@ async def lifespan(app: FastAPI):
     application_started_at = time.time()
 
     logger.info(
-        "Starting Enterprise Policy RAG..."
+        "APPLICATION_STARTING | "
+        "name=%s | version=%s",
+        APP_NAME,
+        APP_VERSION,
     )
 
     try:
@@ -100,13 +154,13 @@ async def lifespan(app: FastAPI):
         rag = create_rag()
 
         logger.info(
-            "RAG engine initialized successfully."
+            "RAG_INITIALIZED"
         )
 
     except Exception:
 
         logger.exception(
-            "RAG initialization failed."
+            "RAG_INITIALIZATION_FAILED"
         )
 
         raise
@@ -114,7 +168,7 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info(
-        "Enterprise Policy RAG shutting down."
+        "APPLICATION_SHUTDOWN"
     )
 
 
@@ -124,20 +178,34 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
 
-    title="Enterprise Policy RAG",
+    title="Enterprise Policy RAG API",
 
     description=(
         "Enterprise employee-policy "
-        "Retrieval-Augmented Generation API"
+        "Retrieval-Augmented Generation service."
     ),
 
-    version="1.0.0",
+    version=APP_VERSION,
 
     lifespan=lifespan,
 
     docs_url="/docs",
 
     redoc_url="/redoc",
+
+    openapi_url="/openapi.json",
+)
+
+
+# ============================================================
+# RATE LIMITER REGISTRATION
+# ============================================================
+
+app.state.limiter = limiter
+
+app.add_exception_handler(
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler,
 )
 
 
@@ -160,24 +228,52 @@ app.add_middleware(
 
 
 # ============================================================
-# API MODELS
+# REQUEST / RESPONSE MODELS
 # ============================================================
 
 class AskRequest(BaseModel):
 
     question: str = Field(
         ...,
-        min_length=2,
-        max_length=2000,
+        min_length=3,
+        max_length=1500,
+        description=(
+            "Employee policy question."
+        ),
         examples=[
-            "What happens to my outstanding loan if I resign?"
+            (
+                "What happens to my outstanding "
+                "loan if I resign?"
+            )
         ],
     )
 
-    top_k: Optional[int] = Field(
-        default=10,
-        ge=1,
-        le=20,
+    top_k: int = Field(
+        default=DEFAULT_TOP_K,
+        ge=3,
+        le=MAX_TOP_K,
+        description=(
+            "Number of policy chunks retrieved "
+            "before generation."
+        ),
+    )
+
+
+class RetrievalRequest(BaseModel):
+
+    question: str = Field(
+        ...,
+        min_length=3,
+        max_length=1500,
+        description=(
+            "Question used for retrieval testing."
+        ),
+    )
+
+    top_k: int = Field(
+        default=DEFAULT_TOP_K,
+        ge=3,
+        le=MAX_TOP_K,
     )
 
 
@@ -194,6 +290,21 @@ class SourceResponse(BaseModel):
     text: str
 
 
+
+
+class TimingResponse(BaseModel):
+
+    cache_lookup_ms: float
+
+    retrieval_ms: float
+
+    context_ms: float
+
+    generation_ms: float
+
+    total_ms: float
+
+
 class AskResponse(BaseModel):
 
     request_id: str
@@ -206,32 +317,70 @@ class AskResponse(BaseModel):
 
     generation_model: Optional[str]
 
+    fallback_used: bool
+
+    cache_hit: bool
+
+    retrieval_top_score: Optional[float]
+
+    timings: TimingResponse
+
     sources: List[SourceResponse]
 
     processing_time_ms: float
 
+class RetrievalResult(BaseModel):
 
-class RetrievalRequest(BaseModel):
+    rank: int
 
-    question: str = Field(
-        ...,
-        min_length=2,
-        max_length=2000,
-    )
+    score: float
 
-    top_k: int = Field(
-        default=10,
-        ge=1,
-        le=20,
-    )
+    source: str
+
+    section: str
+
+    text: str
+
+
+    
+
+class RetrievalResponse(BaseModel):
+
+    request_id: str
+
+    question: str
+
+    top_k: int
+
+    retrieval_time_ms: float
+
+    results: List[RetrievalResult]
+
+
+class HealthResponse(BaseModel):
+
+    status: str
+
+    application: str
+
+    version: str
+
+    uptime_seconds: float
+
+
+class ReadyResponse(BaseModel):
+
+    status: str
+
+    rag_initialized: bool
 
 
 # ============================================================
-# REQUEST ID + TIMING MIDDLEWARE
+# REQUEST ID + HTTP TIMING MIDDLEWARE
 # ============================================================
 
 @app.middleware("http")
-async def request_metadata(
+async def request_metadata_middleware(
     request: Request,
     call_next,
 ):
@@ -240,9 +389,13 @@ async def request_metadata(
         uuid.uuid4()
     )
 
-    request.state.request_id = request_id
+    request.state.request_id = (
+        request_id
+    )
 
-    started = time.perf_counter()
+    started = (
+        time.perf_counter()
+    )
 
     try:
 
@@ -253,33 +406,49 @@ async def request_metadata(
     except Exception:
 
         logger.exception(
-            "Unhandled request failure | "
-            "request_id=%s",
+            "HTTP_UNHANDLED_ERROR | "
+            "request_id=%s | "
+            "method=%s | "
+            "path=%s",
             request_id,
+            request.method,
+            request.url.path,
         )
 
         raise
 
     duration_ms = (
-        time.perf_counter() - started
+
+        time.perf_counter()
+        - started
+
     ) * 1000
+
 
     response.headers[
         "X-Request-ID"
     ] = request_id
 
+
     response.headers[
         "X-Processing-Time-MS"
     ] = f"{duration_ms:.2f}"
 
+
     logger.info(
-        "HTTP | %s %s | %s | %.2fms | %s",
+        "HTTP_REQUEST | "
+        "request_id=%s | "
+        "method=%s | "
+        "path=%s | "
+        "status=%s | "
+        "duration_ms=%.2f",
+        request_id,
         request.method,
         request.url.path,
         response.status_code,
         duration_ms,
-        request_id,
     )
+
 
     return response
 
@@ -300,68 +469,40 @@ async def global_exception_handler(
         "unknown",
     )
 
+
     logger.exception(
-        "Application error | request_id=%s",
+        "APPLICATION_ERROR | "
+        "request_id=%s",
         request_id,
     )
+
 
     return JSONResponse(
 
         status_code=500,
 
         content={
-            "error": "Internal server error",
-            "message": (
-                "The service could not "
-                "complete the request."
-            ),
-            "request_id": request_id,
+
+            "error":
+                "internal_server_error",
+
+            "message":
+                (
+                    "The service could not "
+                    "complete the request."
+                ),
+
+            "request_id":
+                request_id,
         },
     )
 
 
 # ============================================================
-# HEALTH
+# HELPER FUNCTIONS
 # ============================================================
 
-@app.get("/health")
-def health():
-
-    uptime = 0
-
-    if application_started_at:
-
-        uptime = round(
-            time.time()
-            - application_started_at,
-            2,
-        )
-
-    return {
-
-        "status":
-            "healthy",
-
-        "application":
-            "enterprise-policy-RAG",
-
-        "version":
-            "1.0.0",
-
-        "rag_initialized":
-            rag is not None,
-
-        "uptime_seconds":
-            uptime,
-    }
-
-
-# ============================================================
-# READINESS
-# ============================================================
-
-@app.get("/ready")
-def ready():
+def require_rag():
 
     if rag is None:
 
@@ -374,41 +515,244 @@ def ready():
                 "RAG service is not ready.",
         )
 
+
+def build_section(
+    chunk,
+) -> str:
+
+    return " > ".join(
+
+        heading
+
+        for heading in [
+
+            chunk.heading_1,
+            chunk.heading_2,
+            chunk.heading_3,
+
+        ]
+
+        if heading
+    )
+
+
+# ============================================================
+# DEVELOPER CONSOLE
+# ============================================================
+
+@app.get(
+    "/",
+    response_class=FileResponse,
+    include_in_schema=False,
+)
+def developer_console():
+
+    if not INDEX_FILE.exists():
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=(
+                "Developer console file "
+                "static/index.html was not found."
+            ),
+        )
+
+
+    return FileResponse(
+        INDEX_FILE
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["System"],
+)
+def health():
+
+    uptime = 0.0
+
+
+    if application_started_at:
+
+        uptime = round(
+
+            time.time()
+            - application_started_at,
+
+            2,
+        )
+
+
+    return HealthResponse(
+
+        status="healthy",
+
+        application=APP_NAME,
+
+        version=APP_VERSION,
+
+        uptime_seconds=uptime,
+    )
+
+
+# ============================================================
+# READINESS
+# ============================================================
+
+@app.get(
+    "/ready",
+    response_model=ReadyResponse,
+    tags=["System"],
+)
+def readiness():
+
+    require_rag()
+
+
+    return ReadyResponse(
+
+        status="ready",
+
+        rag_initialized=True,
+    )
+
+
+# ============================================================
+# API INFORMATION
+# ============================================================
+
+@app.get(
+    "/api/info",
+    tags=["System"],
+)
+def api_info():
+
     return {
 
-        "status":
-            "ready",
+        "application":
+            APP_NAME,
 
-        "rag_initialized":
-            True,
+        "version":
+            APP_VERSION,
+
+        "status":
+            (
+                "ready"
+                if rag is not None
+                else "starting"
+            ),
+
+        "api_version":
+            "v1",
+
+        "features": [
+
+            "Gemini query embeddings",
+
+            "Qdrant vector retrieval",
+
+            "Gemini generation",
+
+            "Gemini model fallback",
+
+            "Groq provider fallback",
+
+            "rate limiting",
+
+            "request tracing",
+
+            "retrieval observability",
+
+            "Swagger/OpenAPI",
+
+            "built-in developer console",
+        ],
+
+        "rate_limits": {
+
+            "ask":
+                "20 requests/minute/IP",
+
+            "retrieval":
+                "30 requests/minute/IP",
+        },
+
+        "endpoints": {
+
+            "console":
+                "/",
+
+            "health":
+                "/health",
+
+            "readiness":
+                "/ready",
+
+            "ask":
+                f"{API_PREFIX}/ask",
+
+            "retrieval":
+                f"{API_PREFIX}/retrieval",
+
+            "swagger":
+                "/docs",
+
+            "redoc":
+                "/redoc",
+        },
     }
 
 
 # ============================================================
-# ASK
+# MAIN RAG ENDPOINT
 # ============================================================
 
 @app.post(
-    "/ask",
+    f"{API_PREFIX}/ask",
     response_model=AskResponse,
+    tags=["RAG"],
 )
-def ask(
-    payload: AskRequest,
+@limiter.limit("20/minute")
+def ask_policy(
     request: Request,
+    payload: AskRequest,
 ):
 
-    if rag is None:
+    require_rag()
 
-        raise HTTPException(
-            status_code=503,
-            detail="RAG service is not ready.",
-        )
 
-    request_id = request.state.request_id
+    request_id = (
+        request.state.request_id
+    )
 
-    question = payload.question.strip()
 
-    started = time.perf_counter()
+    question = (
+        payload.question.strip()
+    )
+
+
+    started = (
+        time.perf_counter()
+    )
+
+
+    logger.info(
+        "RAG_REQUEST | "
+        "request_id=%s | "
+        "top_k=%d | "
+        "question=%r",
+        request_id,
+        payload.top_k,
+        question,
+    )
+
 
     try:
 
@@ -419,33 +763,53 @@ def ask(
             top_k=payload.top_k,
         )
 
+
     except ValueError as error:
 
         raise HTTPException(
-            status_code=400,
-            detail=str(error),
+
+            status_code=
+                status.HTTP_400_BAD_REQUEST,
+
+            detail=
+                str(error),
         )
+
 
     except Exception:
 
         logger.exception(
-            "RAG request failed | %s",
+            "RAG_REQUEST_FAILED | "
+            "request_id=%s",
             request_id,
         )
 
+
         raise HTTPException(
 
-            status_code=503,
+            status_code=
+                status.HTTP_503_SERVICE_UNAVAILABLE,
 
             detail=(
-                "AI service temporarily "
-                "unavailable."
+                "The AI service is temporarily "
+                "unavailable. Please try again."
             ),
         )
 
+
     processing_time_ms = (
-        time.perf_counter() - started
+
+        time.perf_counter()
+        - started
+
     ) * 1000
+
+
+    raw_sources = result.get(
+        "sources",
+        [],
+    )
+
 
     sources = [
 
@@ -477,1509 +841,280 @@ def ask(
             ),
         )
 
-        for source in result.get(
-            "sources",
-            [],
-        )
+        for source
+        in raw_sources
     ]
+
+
+    retrieval_top_score = None
+
+
+    if raw_sources:
+
+        retrieval_top_score = max(
+
+            source.get(
+                "score",
+                0.0,
+            )
+
+            for source
+            in raw_sources
+        )
+
+
+    retrieved_sections = [
+
+        source.get(
+            "section",
+            "",
+        )
+
+        for source
+        in raw_sources
+    ]
+
+
+    provider = result.get(
+        "generation_provider"
+    )
+
+
+    model = result.get(
+        "generation_model"
+    )
+
+
+    fallback_used = (
+        provider == "groq"
+    )
+
+
+    logger.info(
+        "RAG_COMPLETED | "
+        "request_id=%s | "
+        "provider=%s | "
+        "model=%s | "
+        "fallback_used=%s | "
+        "retrieval_top_score=%s | "
+        "retrieved_sections=%s | "
+        "duration_ms=%.2f",
+        request_id,
+        provider,
+        model,
+        fallback_used,
+        retrieval_top_score,
+        retrieved_sections,
+        processing_time_ms,
+    )
+
 
     return AskResponse(
 
-        request_id=request_id,
+        request_id=
+            request_id,
 
-        question=question,
+        question=
+            question,
 
-        answer=result["answer"],
+        answer=
+            result["answer"],
 
-        generation_provider=result.get(
-            "generation_provider"
-        ),
+        generation_provider=
+            provider,
 
-        generation_model=result.get(
-            "generation_model"
-        ),
+        generation_model=
+            model,
 
-        sources=sources,
+        fallback_used=
+            fallback_used,
 
-        processing_time_ms=round(
-            processing_time_ms,
-            2,
-        ),
+        cache_hit=
+            result.get(
+                "cache_hit",
+                False,
+            ),
+
+        retrieval_top_score=
+            retrieval_top_score,
+
+        timings=
+            TimingResponse(
+                **result.get(
+                    "timings",
+                    {
+                        "cache_lookup_ms": 0.0,
+                        "retrieval_ms": 0.0,
+                        "context_ms": 0.0,
+                        "generation_ms": 0.0,
+                        "total_ms": processing_time_ms,
+                    },
+                )
+            ),
+
+        sources=
+            sources,
+
+        processing_time_ms=
+            round(
+                processing_time_ms,
+                2,
+            ),
     )
 
 
 # ============================================================
-# RETRIEVAL DEBUG
+# RETRIEVAL ENDPOINT
 # ============================================================
 
-@app.post("/debug/retrieval")
-def debug_retrieval(
+@app.post(
+    f"{API_PREFIX}/retrieval",
+    response_model=RetrievalResponse,
+    tags=["RAG"],
+)
+@limiter.limit("30/minute")
+def retrieve_policy_chunks(
+    request: Request,
     payload: RetrievalRequest,
 ):
 
-    if rag is None:
+    require_rag()
 
-        raise HTTPException(
-            status_code=503,
-            detail="RAG service is not ready.",
-        )
 
-    chunks = rag.retriever.retrieve(
-
-        question=payload.question,
-
-        top_k=payload.top_k,
+    request_id = (
+        request.state.request_id
     )
 
-    results = []
 
-    for rank, chunk in enumerate(
-        chunks,
-        start=1,
-    ):
+    question = (
+        payload.question.strip()
+    )
 
-        section = " > ".join(
 
-            heading
+    started = (
+        time.perf_counter()
+    )
 
-            for heading in [
 
-                chunk.heading_1,
-                chunk.heading_2,
-                chunk.heading_3,
+    try:
 
-            ]
+        chunks = (
+            rag.retriever.retrieve(
 
-            if heading
+                question=question,
+
+                top_k=payload.top_k,
+            )
         )
 
-        results.append({
 
-            "rank":
-                rank,
+    except ValueError as error:
 
-            "score":
-                round(
-                    chunk.score,
-                    4,
-                ),
+        raise HTTPException(
 
-            "source":
+            status_code=
+                status.HTTP_400_BAD_REQUEST,
+
+            detail=
+                str(error),
+        )
+
+
+    except Exception:
+
+        logger.exception(
+            "RETRIEVAL_FAILED | "
+            "request_id=%s",
+            request_id,
+        )
+
+
+        raise HTTPException(
+
+            status_code=
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+
+            detail=(
+                "Retrieval service is temporarily "
+                "unavailable."
+            ),
+        )
+
+
+    retrieval_time_ms = (
+
+        time.perf_counter()
+        - started
+
+    ) * 1000
+
+
+    results = [
+
+        RetrievalResult(
+
+            rank=rank,
+
+            score=round(
+                chunk.score,
+                4,
+            ),
+
+            source=
                 chunk.source,
 
-            "section":
-                section,
+            section=
+                build_section(
+                    chunk
+                ),
 
-            "text":
+            text=
                 chunk.text,
-        })
+        )
 
-    return {
+        for rank, chunk in enumerate(
+            chunks,
+            start=1,
+        )
+    ]
 
-        "question":
-            payload.question,
 
-        "results":
+    logger.info(
+        "RETRIEVAL_COMPLETED | "
+        "request_id=%s | "
+        "top_k=%d | "
+        "top_score=%s | "
+        "duration_ms=%.2f",
+        request_id,
+        payload.top_k,
+        (
+            results[0].score
+            if results
+            else None
+        ),
+        retrieval_time_ms,
+    )
+
+
+    return RetrievalResponse(
+
+        request_id=
+            request_id,
+
+        question=
+            question,
+
+        top_k=
+            payload.top_k,
+
+        retrieval_time_ms=
+            round(
+                retrieval_time_ms,
+                2,
+            ),
+
+        results=
             results,
-    }
-
-
-# ============================================================
-# API INFORMATION
-# ============================================================
-
-@app.get("/api/info")
-def api_info():
-
-    return {
-
-        "application":
-            "enterprise-policy-RAG",
-
-        "version":
-            "1.0.0",
-
-        "status":
-            "ready"
-            if rag is not None
-            else "starting",
-
-        "endpoints": {
-
-            "console":
-                "/",
-
-            "health":
-                "/health",
-
-            "readiness":
-                "/ready",
-
-            "ask":
-                "/ask",
-
-            "retrieval_debug":
-                "/debug/retrieval",
-
-            "swagger":
-                "/docs",
-
-            "redoc":
-                "/redoc",
-        },
-    }
-
-
-# ============================================================
-# BUILT-IN DEVELOPER CONSOLE
-# ============================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def developer_console():
-
-    """
-    A lightweight developer console served directly by FastAPI.
-
-    No Streamlit.
-    No React.
-    No Node.
-    No separate frontend service.
-    """
-
-    return HTMLResponse(
-        content="""
-<!DOCTYPE html>
-
-<html lang="en">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
-
-<title>Enterprise Policy RAG</title>
-
-<style>
-
-/* ==========================================================
-   BASE
-   ========================================================== */
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-
-    margin: 0;
-
-    background: #0b0d10;
-
-    color: #e8eaed;
-
-    font-family:
-        Inter,
-        ui-sans-serif,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-}
-
-
-/* ==========================================================
-   HEADER
-   ========================================================== */
-
-header {
-
-    border-bottom:
-        1px solid #242830;
-
-    padding:
-        22px 32px;
-
-    display:
-        flex;
-
-    justify-content:
-        space-between;
-
-    align-items:
-        center;
-
-    background:
-        #111419;
-}
-
-
-.brand {
-
-    font-size:
-        21px;
-
-    font-weight:
-        700;
-
-    letter-spacing:
-        -0.3px;
-}
-
-
-.subtitle {
-
-    color:
-        #8f98a7;
-
-    font-size:
-        13px;
-
-    margin-top:
-        5px;
-}
-
-
-.header-links a {
-
-    color:
-        #b8c0cc;
-
-    text-decoration:
-        none;
-
-    margin-left:
-        22px;
-
-    font-size:
-        14px;
-}
-
-
-.header-links a:hover {
-
-    color:
-        white;
-}
-
-
-/* ==========================================================
-   CONTAINER
-   ========================================================== */
-
-.container {
-
-    max-width:
-        1450px;
-
-    margin:
-        auto;
-
-    padding:
-        28px;
-}
-
-
-/* ==========================================================
-   STATUS CARDS
-   ========================================================== */
-
-.status-grid {
-
-    display:
-        grid;
-
-    grid-template-columns:
-        repeat(
-            4,
-            1fr
-        );
-
-    gap:
-        14px;
-
-    margin-bottom:
-        25px;
-}
-
-
-.status-card {
-
-    background:
-        #12161c;
-
-    border:
-        1px solid #252b34;
-
-    border-radius:
-        10px;
-
-    padding:
-        17px;
-}
-
-
-.status-label {
-
-    color:
-        #8d96a4;
-
-    font-size:
-        12px;
-
-    text-transform:
-        uppercase;
-
-    letter-spacing:
-        .8px;
-}
-
-
-.status-value {
-
-    margin-top:
-        9px;
-
-    font-size:
-        16px;
-
-    font-weight:
-        600;
-}
-
-
-.good {
-
-    color:
-        #58d68d;
-}
-
-
-.bad {
-
-    color:
-        #ff6b6b;
-}
-
-
-/* ==========================================================
-   MAIN GRID
-   ========================================================== */
-
-.main-grid {
-
-    display:
-        grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap:
-        20px;
-}
-
-
-.panel {
-
-    background:
-        #12161c;
-
-    border:
-        1px solid #252b34;
-
-    border-radius:
-        12px;
-
-    overflow:
-        hidden;
-}
-
-
-.panel-header {
-
-    padding:
-        16px 18px;
-
-    border-bottom:
-        1px solid #252b34;
-
-    font-weight:
-        600;
-}
-
-
-.panel-body {
-
-    padding:
-        18px;
-}
-
-
-/* ==========================================================
-   ENDPOINT SELECTOR
-   ========================================================== */
-
-.endpoint-row {
-
-    display:
-        flex;
-
-    gap:
-        10px;
-
-    margin-bottom:
-        18px;
-}
-
-
-.method {
-
-    background:
-        #174e36;
-
-    color:
-        #7ee2ad;
-
-    border:
-        1px solid #26694b;
-
-    padding:
-        9px 12px;
-
-    border-radius:
-        6px;
-
-    font-size:
-        13px;
-
-    font-weight:
-        700;
-}
-
-
-.endpoint {
-
-    flex:
-        1;
-
-    background:
-        #0d1014;
-
-    border:
-        1px solid #292f39;
-
-    color:
-        #e6e8eb;
-
-    padding:
-        9px 12px;
-
-    border-radius:
-        6px;
-
-    font-family:
-        monospace;
-}
-
-
-/* ==========================================================
-   BUTTONS
-   ========================================================== */
-
-button {
-
-    border:
-        0;
-
-    border-radius:
-        7px;
-
-    padding:
-        10px 16px;
-
-    font-weight:
-        600;
-
-    cursor:
-        pointer;
-}
-
-
-.primary {
-
-    background:
-        #e8eaed;
-
-    color:
-        #111;
-}
-
-
-.secondary {
-
-    background:
-        #20252d;
-
-    color:
-        #e8eaed;
-
-    border:
-        1px solid #343b46;
-}
-
-
-.buttons {
-
-    display:
-        flex;
-
-    gap:
-        10px;
-
-    margin-top:
-        14px;
-}
-
-
-/* ==========================================================
-   CODE AREAS
-   ========================================================== */
-
-textarea {
-
-    width:
-        100%;
-
-    min-height:
-        230px;
-
-    resize:
-        vertical;
-
-    background:
-        #090b0e;
-
-    color:
-        #dce1e8;
-
-    border:
-        1px solid #292f39;
-
-    border-radius:
-        8px;
-
-    padding:
-        14px;
-
-    font-family:
-        "SFMono-Regular",
-        Consolas,
-        monospace;
-
-    font-size:
-        13px;
-
-    line-height:
-        1.55;
-}
-
-
-pre {
-
-    margin:
-        0;
-
-    min-height:
-        410px;
-
-    max-height:
-        680px;
-
-    overflow:
-        auto;
-
-    background:
-        #090b0e;
-
-    border:
-        1px solid #292f39;
-
-    border-radius:
-        8px;
-
-    padding:
-        15px;
-
-    color:
-        #cdd5df;
-
-    font-size:
-        13px;
-
-    line-height:
-        1.55;
-}
-
-
-/* ==========================================================
-   PRESETS
-   ========================================================== */
-
-.presets {
-
-    display:
-        flex;
-
-    flex-wrap:
-        wrap;
-
-    gap:
-        8px;
-
-    margin-bottom:
-        15px;
-}
-
-
-.preset {
-
-    background:
-        #1b2027;
-
-    color:
-        #aeb7c3;
-
-    border:
-        1px solid #303743;
-
-    padding:
-        7px 10px;
-
-    font-size:
-        12px;
-}
-
-
-.preset:hover {
-
-    background:
-        #262d37;
-
-    color:
-        white;
-}
-
-
-/* ==========================================================
-   RESPONSE META
-   ========================================================== */
-
-.response-meta {
-
-    display:
-        flex;
-
-    gap:
-        18px;
-
-    margin-bottom:
-        12px;
-
-    color:
-        #8993a1;
-
-    font-size:
-        12px;
-}
-
-
-/* ==========================================================
-   CURL
-   ========================================================== */
-
-.curl-box {
-
-    margin-top:
-        22px;
-}
-
-
-.curl-title {
-
-    font-size:
-        13px;
-
-    color:
-        #9099a7;
-
-    margin-bottom:
-        8px;
-}
-
-
-/* ==========================================================
-   MOBILE
-   ========================================================== */
-
-@media (
-    max-width: 900px
-) {
-
-    .main-grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
-    .status-grid {
-
-        grid-template-columns:
-            1fr 1fr;
-    }
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-
-<header>
-
-<div>
-
-<div class="brand">
-enterprise-policy-RAG
-</div>
-
-<div class="subtitle">
-FastAPI · Gemini Embeddings · Qdrant · Gemini/Groq Generation
-</div>
-
-</div>
-
-
-<div class="header-links">
-
-<a href="/docs">
-Swagger
-</a>
-
-<a href="/redoc">
-ReDoc
-</a>
-
-<a href="/health">
-Health JSON
-</a>
-
-</div>
-
-</header>
-
-
-<div class="container">
-
-
-<!-- =======================================================
-     STATUS
-     ======================================================= -->
-
-<div class="status-grid">
-
-
-<div class="status-card">
-
-<div class="status-label">
-API
-</div>
-
-<div
-    class="status-value"
-    id="apiStatus"
->
-Checking...
-</div>
-
-</div>
-
-
-<div class="status-card">
-
-<div class="status-label">
-RAG Engine
-</div>
-
-<div
-    class="status-value"
-    id="ragStatus"
->
-Checking...
-</div>
-
-</div>
-
-
-<div class="status-card">
-
-<div class="status-label">
-Readiness
-</div>
-
-<div
-    class="status-value"
-    id="readyStatus"
->
-Checking...
-</div>
-
-</div>
-
-
-<div class="status-card">
-
-<div class="status-label">
-Uptime
-</div>
-
-<div
-    class="status-value"
-    id="uptime"
->
---
-</div>
-
-</div>
-
-
-</div>
-
-
-<!-- =======================================================
-     MAIN
-     ======================================================= -->
-
-<div class="main-grid">
-
-
-<!-- REQUEST ================================================= -->
-
-<div class="panel">
-
-<div class="panel-header">
-API Request
-</div>
-
-
-<div class="panel-body">
-
-
-<div class="endpoint-row">
-
-<select
-    id="endpoint"
-    class="endpoint"
-    onchange="changeEndpoint()"
->
-
-<option value="/ask">
-POST /ask
-</option>
-
-<option value="/debug/retrieval">
-POST /debug/retrieval
-</option>
-
-<option value="/health">
-GET /health
-</option>
-
-<option value="/ready">
-GET /ready
-</option>
-
-<option value="/api/info">
-GET /api/info
-</option>
-
-</select>
-
-</div>
-
-
-<div class="presets">
-
-<button
-    class="preset"
-    onclick="presetLoan()"
->
-Loan + resignation
-</button>
-
-<button
-    class="preset"
-    onclick="presetTravel()"
->
-International travel
-</button>
-
-<button
-    class="preset"
-    onclick="presetCertification()"
->
-Certification
-</button>
-
-<button
-    class="preset"
-    onclick="presetUnknown()"
->
-Unknown policy
-</button>
-
-</div>
-
-
-<textarea
-    id="payload"
->{
-  "question": "What happens to my outstanding loan if I resign?",
-  "top_k": 10
-}</textarea>
-
-
-<div class="buttons">
-
-<button
-    class="primary"
-    onclick="sendRequest()"
->
-Send Request
-</button>
-
-
-<button
-    class="secondary"
-    onclick="copyPayload()"
->
-Copy Payload
-</button>
-
-
-<button
-    class="secondary"
-    onclick="copyCurl()"
->
-Copy cURL
-</button>
-
-</div>
-
-
-<div class="curl-box">
-
-<div class="curl-title">
-Generated cURL
-</div>
-
-<textarea
-    id="curl"
-    readonly
-></textarea>
-
-</div>
-
-
-</div>
-
-</div>
-
-
-<!-- RESPONSE ================================================ -->
-
-<div class="panel">
-
-<div class="panel-header">
-Live Response
-</div>
-
-
-<div class="panel-body">
-
-
-<div class="response-meta">
-
-<span id="httpStatus">
-Status: --
-</span>
-
-<span id="responseTime">
-Time: --
-</span>
-
-<span id="requestId">
-Request: --
-</span>
-
-</div>
-
-
-<pre id="response">Select an endpoint and click "Send Request".</pre>
-
-
-<div class="buttons">
-
-<button
-    class="secondary"
-    onclick="copyResponse()"
->
-Copy Response
-</button>
-
-</div>
-
-
-</div>
-
-</div>
-
-
-</div>
-
-</div>
-
-
-<script>
-
-/* ==========================================================
-   HELPERS
-   ========================================================== */
-
-const payload = document.getElementById(
-    "payload"
-);
-
-const endpoint = document.getElementById(
-    "endpoint"
-);
-
-const responseBox = document.getElementById(
-    "response"
-);
-
-
-/* ==========================================================
-   STATUS
-   ========================================================== */
-
-async function refreshStatus() {
-
-    try {
-
-        const healthResponse = await fetch(
-            "/health"
-        );
-
-        const health = await healthResponse.json();
-
-
-        document.getElementById(
-            "apiStatus"
-        ).innerHTML =
-            '<span class="good">ONLINE</span>';
-
-
-        document.getElementById(
-            "ragStatus"
-        ).innerHTML =
-            health.rag_initialized
-                ? '<span class="good">INITIALIZED</span>'
-                : '<span class="bad">NOT READY</span>';
-
-
-        document.getElementById(
-            "uptime"
-        ).textContent =
-            health.uptime_seconds + " sec";
-
-
-        const readyResponse = await fetch(
-            "/ready"
-        );
-
-
-        document.getElementById(
-            "readyStatus"
-        ).innerHTML =
-            readyResponse.ok
-                ? '<span class="good">READY</span>'
-                : '<span class="bad">NOT READY</span>';
-
-    }
-
-    catch {
-
-        document.getElementById(
-            "apiStatus"
-        ).innerHTML =
-            '<span class="bad">OFFLINE</span>';
-    }
-}
-
-
-refreshStatus();
-
-setInterval(
-    refreshStatus,
-    10000
-);
-
-
-/* ==========================================================
-   PRESETS
-   ========================================================== */
-
-function setQuestion(question) {
-
-    payload.value = JSON.stringify(
-        {
-            question: question,
-            top_k: 10
-        },
-        null,
-        2
-    );
-
-    endpoint.value = "/ask";
-
-    updateCurl();
-}
-
-
-function presetLoan() {
-
-    setQuestion(
-        "What happens to my outstanding loan if I resign?"
-    );
-}
-
-
-function presetTravel() {
-
-    setQuestion(
-        "What approvals do I need for international business travel?"
-    );
-}
-
-
-function presetCertification() {
-
-    setQuestion(
-        "Can the company pay for my professional certification?"
-    );
-}
-
-
-function presetUnknown() {
-
-    setQuestion(
-        "What company car will a new employee receive?"
-    );
-}
-
-
-/* ==========================================================
-   ENDPOINT CHANGE
-   ========================================================== */
-
-function changeEndpoint() {
-
-    const value = endpoint.value;
-
-
-    if (
-        value === "/health"
-        ||
-        value === "/ready"
-        ||
-        value === "/api/info"
-    ) {
-
-        payload.disabled = true;
-
-    }
-
-    else {
-
-        payload.disabled = false;
-    }
-
-
-    updateCurl();
-}
-
-
-/* ==========================================================
-   CURL GENERATOR
-   ========================================================== */
-
-function updateCurl() {
-
-    const path = endpoint.value;
-
-    const base =
-        window.location.origin;
-
-
-    if (
-        path === "/health"
-        ||
-        path === "/ready"
-        ||
-        path === "/api/info"
-    ) {
-
-        document.getElementById(
-            "curl"
-        ).value =
-            `curl "${base}${path}"`;
-
-        return;
-    }
-
-
-    document.getElementById(
-        "curl"
-    ).value =
-`curl -X POST "${base}${path}" \\
-  -H "Content-Type: application/json" \\
-  -d '${payload.value.replace(
-      /'/g,
-      "'\\\\''"
-  )}'`;
-}
-
-
-payload.addEventListener(
-    "input",
-    updateCurl
-);
-
-
-updateCurl();
-
-
-/* ==========================================================
-   SEND REQUEST
-   ========================================================== */
-
-async function sendRequest() {
-
-    const path = endpoint.value;
-
-    const started =
-        performance.now();
-
-
-    responseBox.textContent =
-        "Loading...";
-
-
-    document.getElementById(
-        "httpStatus"
-    ).textContent =
-        "Status: --";
-
-
-    document.getElementById(
-        "requestId"
-    ).textContent =
-        "Request: --";
-
-
-    try {
-
-        let options = {};
-
-
-        if (
-            path !== "/health"
-            &&
-            path !== "/ready"
-            &&
-            path !== "/api/info"
-        ) {
-
-            let parsedPayload;
-
-
-            try {
-
-                parsedPayload =
-                    JSON.parse(
-                        payload.value
-                    );
-
-            }
-
-            catch {
-
-                throw new Error(
-                    "Payload is not valid JSON."
-                );
-            }
-
-
-            options = {
-
-                method:
-                    "POST",
-
-                headers: {
-
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body:
-                    JSON.stringify(
-                        parsedPayload
-                    )
-            };
-        }
-
-
-        const result = await fetch(
-            path,
-            options
-        );
-
-
-        const duration =
-            performance.now()
-            - started;
-
-
-        let data;
-
-
-        try {
-
-            data = await result.json();
-
-        }
-
-        catch {
-
-            data = {
-                error:
-                    "Response was not JSON."
-            };
-        }
-
-
-        responseBox.textContent =
-            JSON.stringify(
-                data,
-                null,
-                2
-            );
-
-
-        document.getElementById(
-            "httpStatus"
-        ).textContent =
-            `Status: ${result.status}`;
-
-
-        document.getElementById(
-            "responseTime"
-        ).textContent =
-            `Time: ${duration.toFixed(0)} ms`;
-
-
-        const requestId =
-            result.headers.get(
-                "X-Request-ID"
-            );
-
-
-        document.getElementById(
-            "requestId"
-        ).textContent =
-            `Request: ${requestId || "--"}`;
-
-    }
-
-    catch (error) {
-
-        responseBox.textContent =
-            JSON.stringify(
-                {
-                    error:
-                        error.message
-                },
-                null,
-                2
-            );
-    }
-}
-
-
-/* ==========================================================
-   COPY HELPERS
-   ========================================================== */
-
-async function copyPayload() {
-
-    await navigator.clipboard.writeText(
-        payload.value
-    );
-}
-
-
-async function copyCurl() {
-
-    await navigator.clipboard.writeText(
-
-        document.getElementById(
-            "curl"
-        ).value
-    );
-}
-
-
-async function copyResponse() {
-
-    await navigator.clipboard.writeText(
-        responseBox.textContent
-    );
-}
-
-
-/* ==========================================================
-   INITIALIZE
-   ========================================================== */
-
-changeEndpoint();
-
-</script>
-
-
-</body>
-
-</html>
-"""
     )
 
 
@@ -1990,6 +1125,7 @@ changeEndpoint();
 if __name__ == "__main__":
 
     import uvicorn
+
 
     uvicorn.run(
 

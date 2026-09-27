@@ -1,0 +1,1327 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>Enterprise Policy RAG</title>
+
+<style>
+
+/* ==========================================================
+   BASE
+   ========================================================== */
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+
+    margin: 0;
+
+    background: #0b0d10;
+
+    color: #e8eaed;
+
+    font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+}
+
+
+/* ==========================================================
+   HEADER
+   ========================================================== */
+
+header {
+
+    border-bottom:
+        1px solid #242830;
+
+    padding:
+        22px 32px;
+
+    display:
+        flex;
+
+    justify-content:
+        space-between;
+
+    align-items:
+        center;
+
+    background:
+        #111419;
+}
+
+
+.brand {
+
+    font-size:
+        21px;
+
+    font-weight:
+        700;
+
+    letter-spacing:
+        -0.3px;
+}
+
+
+.subtitle {
+
+    color:
+        #8f98a7;
+
+    font-size:
+        13px;
+
+    margin-top:
+        5px;
+}
+
+
+.header-links a {
+
+    color:
+        #b8c0cc;
+
+    text-decoration:
+        none;
+
+    margin-left:
+        22px;
+
+    font-size:
+        14px;
+}
+
+
+.header-links a:hover {
+
+    color:
+        white;
+}
+
+
+/* ==========================================================
+   CONTAINER
+   ========================================================== */
+
+.container {
+
+    max-width:
+        1450px;
+
+    margin:
+        auto;
+
+    padding:
+        28px;
+}
+
+
+/* ==========================================================
+   STATUS CARDS
+   ========================================================== */
+
+.status-grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(
+            4,
+            1fr
+        );
+
+    gap:
+        14px;
+
+    margin-bottom:
+        25px;
+}
+
+
+.status-card {
+
+    background:
+        #12161c;
+
+    border:
+        1px solid #252b34;
+
+    border-radius:
+        10px;
+
+    padding:
+        17px;
+}
+
+
+.status-label {
+
+    color:
+        #8d96a4;
+
+    font-size:
+        12px;
+
+    text-transform:
+        uppercase;
+
+    letter-spacing:
+        .8px;
+}
+
+
+.status-value {
+
+    margin-top:
+        9px;
+
+    font-size:
+        16px;
+
+    font-weight:
+        600;
+}
+
+
+.good {
+
+    color:
+        #58d68d;
+}
+
+
+.bad {
+
+    color:
+        #ff6b6b;
+}
+
+
+/* ==========================================================
+   MAIN GRID
+   ========================================================== */
+
+.main-grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap:
+        20px;
+}
+
+
+.panel {
+
+    background:
+        #12161c;
+
+    border:
+        1px solid #252b34;
+
+    border-radius:
+        12px;
+
+    overflow:
+        hidden;
+}
+
+
+.panel-header {
+
+    padding:
+        16px 18px;
+
+    border-bottom:
+        1px solid #252b34;
+
+    font-weight:
+        600;
+}
+
+
+.panel-body {
+
+    padding:
+        18px;
+}
+
+
+/* ==========================================================
+   ENDPOINT SELECTOR
+   ========================================================== */
+
+.endpoint-row {
+
+    display:
+        flex;
+
+    gap:
+        10px;
+
+    margin-bottom:
+        18px;
+}
+
+
+.method {
+
+    background:
+        #174e36;
+
+    color:
+        #7ee2ad;
+
+    border:
+        1px solid #26694b;
+
+    padding:
+        9px 12px;
+
+    border-radius:
+        6px;
+
+    font-size:
+        13px;
+
+    font-weight:
+        700;
+}
+
+
+.endpoint {
+
+    flex:
+        1;
+
+    background:
+        #0d1014;
+
+    border:
+        1px solid #292f39;
+
+    color:
+        #e6e8eb;
+
+    padding:
+        9px 12px;
+
+    border-radius:
+        6px;
+
+    font-family:
+        monospace;
+}
+
+
+/* ==========================================================
+   BUTTONS
+   ========================================================== */
+
+button {
+
+    border:
+        0;
+
+    border-radius:
+        7px;
+
+    padding:
+        10px 16px;
+
+    font-weight:
+        600;
+
+    cursor:
+        pointer;
+}
+
+
+.primary {
+
+    background:
+        #e8eaed;
+
+    color:
+        #111;
+}
+
+
+.secondary {
+
+    background:
+        #20252d;
+
+    color:
+        #e8eaed;
+
+    border:
+        1px solid #343b46;
+}
+
+
+.buttons {
+
+    display:
+        flex;
+
+    gap:
+        10px;
+
+    margin-top:
+        14px;
+}
+
+
+/* ==========================================================
+   CODE AREAS
+   ========================================================== */
+
+textarea {
+
+    width:
+        100%;
+
+    min-height:
+        230px;
+
+    resize:
+        vertical;
+
+    background:
+        #090b0e;
+
+    color:
+        #dce1e8;
+
+    border:
+        1px solid #292f39;
+
+    border-radius:
+        8px;
+
+    padding:
+        14px;
+
+    font-family:
+        "SFMono-Regular",
+        Consolas,
+        monospace;
+
+    font-size:
+        13px;
+
+    line-height:
+        1.55;
+}
+
+
+pre {
+
+    margin:
+        0;
+
+    min-height:
+        410px;
+
+    max-height:
+        680px;
+
+    overflow:
+        auto;
+
+    background:
+        #090b0e;
+
+    border:
+        1px solid #292f39;
+
+    border-radius:
+        8px;
+
+    padding:
+        15px;
+
+    color:
+        #cdd5df;
+
+    font-size:
+        13px;
+
+    line-height:
+        1.55;
+}
+
+
+/* ==========================================================
+   PRESETS
+   ========================================================== */
+
+.presets {
+
+    display:
+        flex;
+
+    flex-wrap:
+        wrap;
+
+    gap:
+        8px;
+
+    margin-bottom:
+        15px;
+}
+
+
+.preset {
+
+    background:
+        #1b2027;
+
+    color:
+        #aeb7c3;
+
+    border:
+        1px solid #303743;
+
+    padding:
+        7px 10px;
+
+    font-size:
+        12px;
+}
+
+
+.preset:hover {
+
+    background:
+        #262d37;
+
+    color:
+        white;
+}
+
+
+/* ==========================================================
+   RESPONSE META
+   ========================================================== */
+
+.response-meta {
+
+    display:
+        flex;
+
+    gap:
+        18px;
+
+    margin-bottom:
+        12px;
+
+    color:
+        #8993a1;
+
+    font-size:
+        12px;
+}
+
+
+/* ==========================================================
+   CURL
+   ========================================================== */
+
+.curl-box {
+
+    margin-top:
+        22px;
+}
+
+
+.curl-title {
+
+    font-size:
+        13px;
+
+    color:
+        #9099a7;
+
+    margin-bottom:
+        8px;
+}
+
+
+/* ==========================================================
+   MOBILE
+   ========================================================== */
+
+@media (
+    max-width: 900px
+) {
+
+    .main-grid {
+
+        grid-template-columns:
+            1fr;
+    }
+
+    .status-grid {
+
+        grid-template-columns:
+            1fr 1fr;
+    }
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div>
+
+<div class="brand">
+enterprise-policy-RAG
+</div>
+
+<div class="subtitle">
+FastAPI · Gemini Embeddings · Qdrant · Gemini/Groq Generation
+</div>
+
+</div>
+
+
+<div class="header-links">
+
+<a href="/docs">
+Swagger
+</a>
+
+<a href="/redoc">
+ReDoc
+</a>
+
+<a href="/health">
+Health JSON
+</a>
+
+</div>
+
+</header>
+
+
+<div class="container">
+
+
+<!-- =======================================================
+     STATUS
+     ======================================================= -->
+
+<div class="status-grid">
+
+
+<div class="status-card">
+
+<div class="status-label">
+API
+</div>
+
+<div
+    class="status-value"
+    id="apiStatus"
+>
+Checking...
+</div>
+
+</div>
+
+
+<div class="status-card">
+
+<div class="status-label">
+RAG Engine
+</div>
+
+<div
+    class="status-value"
+    id="ragStatus"
+>
+Checking...
+</div>
+
+</div>
+
+
+<div class="status-card">
+
+<div class="status-label">
+Readiness
+</div>
+
+<div
+    class="status-value"
+    id="readyStatus"
+>
+Checking...
+</div>
+
+</div>
+
+
+<div class="status-card">
+
+<div class="status-label">
+Uptime
+</div>
+
+<div
+    class="status-value"
+    id="uptime"
+>
+--
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- =======================================================
+     MAIN
+     ======================================================= -->
+
+<div class="main-grid">
+
+
+<!-- REQUEST ================================================= -->
+
+<div class="panel">
+
+<div class="panel-header">
+API Request
+</div>
+
+
+<div class="panel-body">
+
+
+<div class="endpoint-row">
+
+<select
+    id="endpoint"
+    class="endpoint"
+    onchange="changeEndpoint()"
+>
+
+<option value="/api/v1/ask">
+POST /api/v1/ask
+</option>
+
+<option value="/api/v1/retrieval">
+POST /api/v1/retrieval
+</option>
+
+<option value="/health">
+GET /health
+</option>
+
+<option value="/ready">
+GET /ready
+</option>
+
+<option value="/api/info">
+GET /api/info
+</option>
+
+</select>
+
+</div>
+
+
+<div class="presets">
+
+<button
+    class="preset"
+    onclick="presetLoan()"
+>
+Loan + resignation
+</button>
+
+<button
+    class="preset"
+    onclick="presetTravel()"
+>
+International travel
+</button>
+
+<button
+    class="preset"
+    onclick="presetCertification()"
+>
+Certification
+</button>
+
+<button
+    class="preset"
+    onclick="presetUnknown()"
+>
+Unknown policy
+</button>
+
+</div>
+
+
+<textarea
+    id="payload"
+>{
+  "question": "What happens to my outstanding loan if I resign?",
+  "top_k": 10
+}</textarea>
+
+
+<div class="buttons">
+
+<button
+    class="primary"
+    onclick="sendRequest()"
+>
+Send Request
+</button>
+
+
+<button
+    class="secondary"
+    onclick="copyPayload()"
+>
+Copy Payload
+</button>
+
+
+<button
+    class="secondary"
+    onclick="copyCurl()"
+>
+Copy cURL
+</button>
+
+</div>
+
+
+<div class="curl-box">
+
+<div class="curl-title">
+Generated cURL
+</div>
+
+<textarea
+    id="curl"
+    readonly
+></textarea>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- RESPONSE ================================================ -->
+
+<div class="panel">
+
+<div class="panel-header">
+Live Response
+</div>
+
+
+<div class="panel-body">
+
+
+<div class="response-meta">
+
+<span id="httpStatus">
+Status: --
+</span>
+
+<span id="responseTime">
+Time: --
+</span>
+
+<span id="requestId">
+Request: --
+</span>
+
+</div>
+
+
+<pre id="response">Select an endpoint and click "Send Request".</pre>
+
+
+<div class="buttons">
+
+<button
+    class="secondary"
+    onclick="copyResponse()"
+>
+Copy Response
+</button>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<script>
+
+/* ==========================================================
+   HELPERS
+   ========================================================== */
+
+const payload = document.getElementById(
+    "payload"
+);
+
+const endpoint = document.getElementById(
+    "endpoint"
+);
+
+const responseBox = document.getElementById(
+    "response"
+);
+
+
+/* ==========================================================
+   STATUS
+   ========================================================== */
+
+async function refreshStatus() {
+
+    try {
+
+        const healthResponse = await fetch(
+            "/health"
+        );
+
+        const health = await healthResponse.json();
+
+
+        document.getElementById(
+            "apiStatus"
+        ).innerHTML =
+            '<span class="good">ONLINE</span>';
+
+
+        document.getElementById(
+            "ragStatus"
+        ).innerHTML =
+            health.rag_initialized
+                ? '<span class="good">INITIALIZED</span>'
+                : '<span class="bad">NOT READY</span>';
+
+
+        document.getElementById(
+            "uptime"
+        ).textContent =
+            health.uptime_seconds + " sec";
+
+
+        const readyResponse = await fetch(
+            "/ready"
+        );
+
+
+        document.getElementById(
+            "readyStatus"
+        ).innerHTML =
+            readyResponse.ok
+                ? '<span class="good">READY</span>'
+                : '<span class="bad">NOT READY</span>';
+
+    }
+
+    catch {
+
+        document.getElementById(
+            "apiStatus"
+        ).innerHTML =
+            '<span class="bad">OFFLINE</span>';
+    }
+}
+
+
+refreshStatus();
+
+setInterval(
+    refreshStatus,
+    10000
+);
+
+
+/* ==========================================================
+   PRESETS
+   ========================================================== */
+
+function setQuestion(question) {
+
+    payload.value = JSON.stringify(
+        {
+            question: question,
+            top_k: 10
+        },
+        null,
+        2
+    );
+
+    endpoint.value = "/api/v1/ask";
+
+    updateCurl();
+}
+
+
+function presetLoan() {
+
+    setQuestion(
+        "What happens to my outstanding loan if I resign?"
+    );
+}
+
+
+function presetTravel() {
+
+    setQuestion(
+        "What approvals do I need for international business travel?"
+    );
+}
+
+
+function presetCertification() {
+
+    setQuestion(
+        "Can the company pay for my professional certification?"
+    );
+}
+
+
+function presetUnknown() {
+
+    setQuestion(
+        "What company car will a new employee receive?"
+    );
+}
+
+
+/* ==========================================================
+   ENDPOINT CHANGE
+   ========================================================== */
+
+function changeEndpoint() {
+
+    const value = endpoint.value;
+
+
+    if (
+        value === "/health"
+        ||
+        value === "/ready"
+        ||
+        value === "/api/info"
+    ) {
+
+        payload.disabled = true;
+
+    }
+
+    else {
+
+        payload.disabled = false;
+    }
+
+
+    updateCurl();
+}
+
+
+/* ==========================================================
+   CURL GENERATOR
+   ========================================================== */
+
+function updateCurl() {
+
+    const path = endpoint.value;
+
+    const base =
+        window.location.origin;
+
+
+    if (
+        path === "/health"
+        ||
+        path === "/ready"
+        ||
+        path === "/api/info"
+    ) {
+
+        document.getElementById(
+            "curl"
+        ).value =
+            `curl "${base}${path}"`;
+
+        return;
+    }
+
+
+    document.getElementById(
+        "curl"
+    ).value =
+`curl -X POST "${base}${path}" \\
+  -H "Content-Type: application/json" \\
+  -d '${payload.value.replace(
+      /'/g,
+      "'\\\\''"
+  )}'`;
+}
+
+
+payload.addEventListener(
+    "input",
+    updateCurl
+);
+
+
+updateCurl();
+
+
+/* ==========================================================
+   SEND REQUEST
+   ========================================================== */
+
+async function sendRequest() {
+
+    const path = endpoint.value;
+
+    const started =
+        performance.now();
+
+
+    responseBox.textContent =
+        "Loading...";
+
+
+    document.getElementById(
+        "httpStatus"
+    ).textContent =
+        "Status: --";
+
+
+    document.getElementById(
+        "requestId"
+    ).textContent =
+        "Request: --";
+
+
+    try {
+
+        let options = {};
+
+
+        if (
+            path !== "/health"
+            &&
+            path !== "/ready"
+            &&
+            path !== "/api/info"
+        ) {
+
+            let parsedPayload;
+
+
+            try {
+
+                parsedPayload =
+                    JSON.parse(
+                        payload.value
+                    );
+
+            }
+
+            catch {
+
+                throw new Error(
+                    "Payload is not valid JSON."
+                );
+            }
+
+
+            options = {
+
+                method:
+                    "POST",
+
+                headers: {
+
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify(
+                        parsedPayload
+                    )
+            };
+        }
+
+
+        const result = await fetch(
+            path,
+            options
+        );
+
+
+        const duration =
+            performance.now()
+            - started;
+
+
+        let data;
+
+
+        try {
+
+            data = await result.json();
+
+        }
+
+        catch {
+
+            data = {
+                error:
+                    "Response was not JSON."
+            };
+        }
+
+
+        responseBox.textContent =
+            JSON.stringify(
+                data,
+                null,
+                2
+            );
+
+
+        document.getElementById(
+            "httpStatus"
+        ).textContent =
+            `Status: ${result.status}`;
+
+
+        document.getElementById(
+            "responseTime"
+        ).textContent =
+            `Time: ${duration.toFixed(0)} ms`;
+
+
+        const requestId =
+            result.headers.get(
+                "X-Request-ID"
+            );
+
+
+        document.getElementById(
+            "requestId"
+        ).textContent =
+            `Request: ${requestId || "--"}`;
+
+    }
+
+    catch (error) {
+
+        responseBox.textContent =
+            JSON.stringify(
+                {
+                    error:
+                        error.message
+                },
+                null,
+                2
+            );
+    }
+}
+
+
+/* ==========================================================
+   COPY HELPERS
+   ========================================================== */
+
+async function copyPayload() {
+
+    await navigator.clipboard.writeText(
+        payload.value
+    );
+}
+
+
+async function copyCurl() {
+
+    await navigator.clipboard.writeText(
+
+        document.getElementById(
+            "curl"
+        ).value
+    );
+}
+
+
+async function copyResponse() {
+
+    await navigator.clipboard.writeText(
+        responseBox.textContent
+    );
+}
+
+
+/* ==========================================================
+   INITIALIZE
+   ========================================================== */
+
+changeEndpoint();
+
+</script>
+
+
+</body>
+
+</html>
