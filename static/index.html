@@ -800,7 +800,8 @@ Unknown policy
     id="payload"
 >{
   "question": "What happens to my outstanding loan if I resign?",
-  "top_k": 10
+  "top_k": 10,
+  "role": "employee"
 }</textarea>
 
 
@@ -1000,7 +1001,8 @@ function setQuestion(question) {
     payload.value = JSON.stringify(
         {
             question: question,
-            top_k: 10
+            top_k: 10,
+            role: "employee"
         },
         null,
         2

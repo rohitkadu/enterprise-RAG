@@ -66,6 +66,12 @@ from groq import Groq
 
 from qdrant_client import QdrantClient
 
+from qdrant_client.models import (
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
+
 
 # ============================================================
 # LOGGING
@@ -203,6 +209,39 @@ COLLECTION_NAME = (
 )
 
 
+# ============================================================
+# KNOWLEDGE BASE VERSION
+# ============================================================
+
+# IMPORTANT:
+#
+# Increment this whenever the indexed policy knowledge changes.
+#
+# Examples:
+#
+# 2.0 -> current policy corpus
+# 2.1 -> policies updated
+# 3.0 -> major corpus rebuild
+#
+# This version becomes part of the cache key, which prevents
+# stale cached answers after a knowledge-base update.
+
+KNOWLEDGE_BASE_VERSION = "2.0"
+
+
+# ============================================================
+# ACCESS CONTROL
+# ============================================================
+
+ALLOWED_ROLES = {
+    "employee",
+    "manager",
+    "hr",
+}
+
+
+DEFAULT_ROLE = "employee"
+
 # ------------------------------------------------------------
 # RETRIEVAL
 # ------------------------------------------------------------
@@ -317,6 +356,9 @@ ANSWER:
 """.strip()
 
 
+
+
+
 # ============================================================
 # GEMINI EMBEDDING SERVICE
 # ============================================================
@@ -324,10 +366,8 @@ ANSWER:
 class GeminiEmbeddingService:
 
     """
-    Generates an embedding for the USER QUESTION.
-
-    Document embeddings are already permanently stored
-    inside Qdrant.
+    Generates query embeddings using the same embedding model
+    used when the policy corpus was indexed.
     """
 
     def __init__(
@@ -379,14 +419,17 @@ class GeminiEmbeddingService:
                 response = (
                     self.client.models.embed_content(
 
-                        model=self.model,
+                        model=
+                            self.model,
 
-                        contents=text,
+                        contents=
+                            text,
                     )
                 )
 
 
                 vector = list(
+
                     response
                     .embeddings[0]
                     .values
@@ -415,9 +458,33 @@ class GeminiEmbeddingService:
                 )
 
 
-                # --------------------------------------------
-                # Retry only temporary service failures.
-                # --------------------------------------------
+                # google-genai does not always expose
+                # status_code consistently.
+
+                if status_code is None:
+
+                    error_text = str(
+                        error
+                    ).upper()
+
+
+                    if (
+                        "429" in error_text
+                        or "RESOURCE_EXHAUSTED"
+                        in error_text
+                    ):
+
+                        status_code = 429
+
+
+                    elif (
+                        "503" in error_text
+                        or "UNAVAILABLE"
+                        in error_text
+                    ):
+
+                        status_code = 503
+
 
                 if status_code not in {
 
@@ -435,10 +502,16 @@ class GeminiEmbeddingService:
                 if attempt < self.retries:
 
                     delay = (
+
                         1.5
+
                         * (
+
                             2
-                            ** (attempt - 1)
+
+                            ** (
+                                attempt - 1
+                            )
                         )
                     )
 
@@ -461,7 +534,6 @@ class GeminiEmbeddingService:
             "Gemini embedding failed "
             "after all retries."
         ) from last_error
-
 
 # ============================================================
 # QDRANT VECTOR STORE
@@ -492,14 +564,46 @@ class QdrantVectorStore:
         self,
         query_vector: List[float],
         top_k: int,
+        role: str,
     ) -> List[RetrievedChunk]:
+
+        """
+        Search Qdrant with authorization filtering.
+
+        SECURITY PRINCIPLE:
+
+            authorization happens BEFORE documents
+            reach the LLM.
+
+        Qdrant therefore returns only chunks whose
+        access_roles contain the caller's role.
+        """
 
         logger.info(
             "Searching Qdrant | "
             "collection=%s | "
-            "top_k=%d",
+            "top_k=%d | "
+            "role=%s",
             self.collection_name,
             top_k,
+            role,
+        )
+
+
+        access_filter = Filter(
+
+            must=[
+
+                FieldCondition(
+
+                    key="access_roles",
+
+                    match=MatchValue(
+                        value=role
+                    ),
+                )
+
+            ]
         )
 
 
@@ -511,6 +615,9 @@ class QdrantVectorStore:
 
                 query=
                     query_vector,
+
+                query_filter=
+                    access_filter,
 
                 limit=
                     top_k,
@@ -571,13 +678,14 @@ class QdrantVectorStore:
 
 
         logger.info(
-            "Qdrant returned %d chunks",
+            "Qdrant returned %d authorized chunks | "
+            "role=%s",
             len(results),
+            role,
         )
 
 
         return results
-
 
 # ============================================================
 # RETRIEVER
@@ -611,10 +719,18 @@ class Retriever:
         self,
         question: str,
         top_k: Optional[int] = None,
+        role: str = DEFAULT_ROLE,
     ) -> List[RetrievedChunk]:
 
         question = (
             question.strip()
+        )
+
+
+        role = (
+            role
+            .strip()
+            .lower()
         )
 
 
@@ -625,11 +741,16 @@ class Retriever:
             )
 
 
-        # ====================================================
-        # STEP 1
-        #
-        # Generate query embedding.
-        # ====================================================
+        if role not in ALLOWED_ROLES:
+
+            raise ValueError(
+                f"Unsupported role: {role}"
+            )
+
+
+        # ========================================================
+        # QUERY EMBEDDING
+        # ========================================================
 
         query_vector = (
             self.embedding_service
@@ -639,11 +760,9 @@ class Retriever:
         )
 
 
-        # ====================================================
-        # STEP 2
-        #
-        # Search existing Qdrant vectors.
-        # ====================================================
+        # ========================================================
+        # AUTHORIZED VECTOR SEARCH
+        # ========================================================
 
         return self.vector_store.search(
 
@@ -653,8 +772,10 @@ class Retriever:
             top_k=
                 top_k
                 or self.default_top_k,
-        )
 
+            role=
+                role,
+        )
 
 # ============================================================
 # CONTEXT BUILDER
@@ -1754,55 +1875,23 @@ class TTLResponseCache:
 class EnterpriseRAG:
 
     """
-    Main Enterprise RAG service.
+    Main Enterprise RAG application service.
 
-    Pipeline:
+    Features:
 
-        question
-           |
-           v
-        cache
-         / \\
-      hit   miss
-       |      |
-       |   embedding
-       |      |
-       |    Qdrant
-       |      |
-       |    context
-       |      |
-       |   generation
-       |      |
-       +------+
-           |
-         answer
-
-
-    Timings captured:
-
-        retrieval_ms
-            |
-            | includes:
-            | query embedding
-            | +
-            | Qdrant search
-
-        context_ms
-
-        generation_ms
-
-        total_ms
-
-
-    More detailed embedding/Qdrant timings can be added later
-    inside Retriever if necessary.
+    - role-aware retrieval
+    - version-aware caching
+    - latency instrumentation
+    - runtime metrics
+    - Gemini/Groq generation routing
     """
 
     def __init__(
         self,
-        retriever: Retriever,
-        generator: GenerationRouter,
-        cache: Optional[TTLResponseCache] = None,
+        retriever,
+        generator,
+        cache=None,
+        metrics=None,
     ):
 
         self.retriever = (
@@ -1822,6 +1911,15 @@ class EnterpriseRAG:
             else TTLResponseCache()
         )
 
+        self.metrics = (
+
+            metrics
+
+            if metrics is not None
+
+            else RuntimeMetrics()
+        )
+
 
     # ========================================================
     # CACHE KEY
@@ -1831,21 +1929,8 @@ class EnterpriseRAG:
     def _build_cache_key(
         question: str,
         top_k: int,
+        role: str,
     ) -> str:
-
-        """
-        Normalize superficial question differences.
-
-        Example:
-
-            "What is leave policy?"
-
-        and:
-
-            "  WHAT IS LEAVE POLICY?  "
-
-        become the same cache key.
-        """
 
         normalized_question = " ".join(
 
@@ -1857,6 +1942,9 @@ class EnterpriseRAG:
 
 
         return (
+
+            f"{KNOWLEDGE_BASE_VERSION}:"
+            f"{role}:"
             f"{top_k}:"
             f"{normalized_question}"
         )
@@ -1870,6 +1958,7 @@ class EnterpriseRAG:
         self,
         question: str,
         top_k: Optional[int] = None,
+        role: str = DEFAULT_ROLE,
     ) -> Dict[str, Any]:
 
         total_started = (
@@ -1877,8 +1966,19 @@ class EnterpriseRAG:
         )
 
 
+        # ====================================================
+        # INPUT NORMALIZATION
+        # ====================================================
+
         question = (
             question.strip()
+        )
+
+
+        role = (
+            role
+            .strip()
+            .lower()
         )
 
 
@@ -1886,6 +1986,13 @@ class EnterpriseRAG:
 
             raise ValueError(
                 "Question cannot be empty."
+            )
+
+
+        if role not in ALLOWED_ROLES:
+
+            raise ValueError(
+                f"Unsupported role: {role}"
             )
 
 
@@ -1899,6 +2006,10 @@ class EnterpriseRAG:
         )
 
 
+        # ====================================================
+        # CACHE KEY
+        # ====================================================
+
         cache_key = (
             self._build_cache_key(
 
@@ -1907,12 +2018,15 @@ class EnterpriseRAG:
 
                 top_k=
                     effective_top_k,
+
+                role=
+                    role,
             )
         )
 
 
         # ====================================================
-        # 1. CACHE LOOKUP
+        # CACHE LOOKUP
         # ====================================================
 
         cache_started = (
@@ -1981,11 +2095,28 @@ class EnterpriseRAG:
             }
 
 
+            self.metrics.record_success(
+
+                cache_hit=
+                    True,
+
+                provider=
+                    cached_result.get(
+                        "generation_provider"
+                    ),
+
+                latency_ms=
+                    total_ms,
+            )
+
+
             logger.info(
                 "RAG_CACHE_HIT | "
+                "role=%s | "
                 "question=%r | "
                 "top_k=%d | "
                 "total_ms=%.2f",
+                role,
                 question,
                 effective_top_k,
                 total_ms,
@@ -2001,52 +2132,249 @@ class EnterpriseRAG:
 
         logger.info(
             "RAG_CACHE_MISS | "
+            "role=%s | "
             "question=%r | "
             "top_k=%d",
+            role,
             question,
             effective_top_k,
         )
 
 
-        # ====================================================
-        # 2. RETRIEVAL
-        #
-        # Includes:
-        #
-        # Gemini query embedding
-        # +
-        # Qdrant vector search
-        # ====================================================
+        try:
 
-        retrieval_started = (
-            time.perf_counter()
-        )
+            # =================================================
+            # RETRIEVAL
+            # =================================================
 
-
-        retrieved_chunks = (
-            self.retriever.retrieve(
-
-                question=question,
-
-                top_k=
-                    effective_top_k,
+            retrieval_started = (
+                time.perf_counter()
             )
-        )
 
 
-        retrieval_ms = (
+            retrieved_chunks = (
+                self.retriever.retrieve(
 
-            time.perf_counter()
-            - retrieval_started
+                    question=
+                        question,
 
-        ) * 1000
+                    top_k=
+                        effective_top_k,
+
+                    role=
+                        role,
+                )
+            )
 
 
-        # ====================================================
-        # NO RETRIEVAL RESULTS
-        # ====================================================
+            retrieval_ms = (
 
-        if not retrieved_chunks:
+                time.perf_counter()
+                - retrieval_started
+
+            ) * 1000
+
+
+            # =================================================
+            # NO AUTHORIZED RESULTS
+            # =================================================
+
+            if not retrieved_chunks:
+
+                total_ms = (
+
+                    time.perf_counter()
+                    - total_started
+
+                ) * 1000
+
+
+                result = {
+
+                    "question":
+                        question,
+
+                    "role":
+                        role,
+
+                    "knowledge_base_version":
+                        KNOWLEDGE_BASE_VERSION,
+
+                    "answer":
+                        (
+                            "I don't know based on the "
+                            "available policy documents."
+                        ),
+
+                    "generation_provider":
+                        None,
+
+                    "generation_model":
+                        None,
+
+                    "sources":
+                        [],
+
+                    "cache_hit":
+                        False,
+
+                    "timings": {
+
+                        "cache_lookup_ms":
+                            round(
+                                cache_lookup_ms,
+                                2,
+                            ),
+
+                        "retrieval_ms":
+                            round(
+                                retrieval_ms,
+                                2,
+                            ),
+
+                        "context_ms":
+                            0.0,
+
+                        "generation_ms":
+                            0.0,
+
+                        "total_ms":
+                            round(
+                                total_ms,
+                                2,
+                            ),
+                    },
+                }
+
+
+                self.cache.set(
+                    cache_key,
+                    result,
+                )
+
+
+                self.metrics.record_success(
+
+                    cache_hit=
+                        False,
+
+                    provider=
+                        None,
+
+                    latency_ms=
+                        total_ms,
+                )
+
+
+                return result
+
+
+            # =================================================
+            # CONTEXT
+            # =================================================
+
+            context_started = (
+                time.perf_counter()
+            )
+
+
+            context = (
+                ContextBuilder.build(
+                    retrieved_chunks
+                )
+            )
+
+
+            context_ms = (
+
+                time.perf_counter()
+                - context_started
+
+            ) * 1000
+
+
+            # =================================================
+            # GENERATION
+            # =================================================
+
+            generation_started = (
+                time.perf_counter()
+            )
+
+
+            generation_result = (
+                self.generator.generate(
+
+                    question=
+                        question,
+
+                    context=
+                        context,
+                )
+            )
+
+
+            generation_ms = (
+
+                time.perf_counter()
+                - generation_started
+
+            ) * 1000
+
+
+            # =================================================
+            # SOURCES
+            # =================================================
+
+            sources = []
+
+
+            for index, chunk in enumerate(
+                retrieved_chunks,
+                start=1,
+            ):
+
+                section = " > ".join(
+
+                    heading
+
+                    for heading in [
+
+                        chunk.heading_1,
+                        chunk.heading_2,
+                        chunk.heading_3,
+
+                    ]
+
+                    if heading
+                )
+
+
+                sources.append({
+
+                    "number":
+                        index,
+
+                    "score":
+                        round(
+                            chunk.score,
+                            4,
+                        ),
+
+                    "source":
+                        chunk.source,
+
+                    "section":
+                        section,
+
+                    "text":
+                        chunk.text,
+                })
+
+
+            # =================================================
+            # TOTAL
+            # =================================================
 
             total_ms = (
 
@@ -2056,25 +2384,38 @@ class EnterpriseRAG:
             ) * 1000
 
 
+            # =================================================
+            # RESULT
+            # =================================================
+
             result = {
 
                 "question":
                     question,
 
+                "role":
+                    role,
+
+                "knowledge_base_version":
+                    KNOWLEDGE_BASE_VERSION,
+
                 "answer":
-                    (
-                        "I don't know based on the "
-                        "available policy documents."
-                    ),
+                    generation_result[
+                        "answer"
+                    ],
 
                 "generation_provider":
-                    None,
+                    generation_result[
+                        "provider"
+                    ],
 
                 "generation_model":
-                    None,
+                    generation_result[
+                        "model"
+                    ],
 
                 "sources":
-                    [],
+                    sources,
 
                 "cache_hit":
                     False,
@@ -2094,10 +2435,16 @@ class EnterpriseRAG:
                         ),
 
                     "context_ms":
-                        0.0,
+                        round(
+                            context_ms,
+                            2,
+                        ),
 
                     "generation_ms":
-                        0.0,
+                        round(
+                            generation_ms,
+                            2,
+                        ),
 
                     "total_ms":
                         round(
@@ -2108,235 +2455,300 @@ class EnterpriseRAG:
             }
 
 
+            # =================================================
+            # CACHE
+            # =================================================
+
+            self.cache.set(
+
+                cache_key,
+
+                result,
+            )
+
+
+            # =================================================
+            # METRICS
+            # =================================================
+
+            self.metrics.record_success(
+
+                cache_hit=
+                    False,
+
+                provider=
+                    result.get(
+                        "generation_provider"
+                    ),
+
+                latency_ms=
+                    total_ms,
+            )
+
+
+            # =================================================
+            # OBSERVABILITY
+            # =================================================
+
+            logger.info(
+                "RAG_TIMING | "
+                "role=%s | "
+                "kb_version=%s | "
+                "provider=%s | "
+                "model=%s | "
+                "cache_hit=false | "
+                "retrieval_ms=%.2f | "
+                "context_ms=%.2f | "
+                "generation_ms=%.2f | "
+                "total_ms=%.2f",
+                role,
+                KNOWLEDGE_BASE_VERSION,
+                result[
+                    "generation_provider"
+                ],
+                result[
+                    "generation_model"
+                ],
+                retrieval_ms,
+                context_ms,
+                generation_ms,
+                total_ms,
+            )
+
+
             return result
 
 
-        # ====================================================
-        # 3. CONTEXT BUILDING
-        # ====================================================
+        except Exception:
 
-        context_started = (
-            time.perf_counter()
-        )
+            self.metrics.record_error()
 
-
-        context = (
-            ContextBuilder.build(
-                retrieved_chunks
-            )
-        )
-
-
-        context_ms = (
-
-            time.perf_counter()
-            - context_started
-
-        ) * 1000
-
-
-        # ====================================================
-        # 4. GENERATION
-        # ====================================================
-
-        generation_started = (
-            time.perf_counter()
-        )
-
-
-        generation_result = (
-            self.generator.generate(
-
-                question=question,
-
-                context=context,
-            )
-        )
-
-
-        generation_ms = (
-
-            time.perf_counter()
-            - generation_started
-
-        ) * 1000
-
-
-        # ====================================================
-        # 5. SOURCE METADATA
-        # ====================================================
-
-        sources = []
-
-
-        for index, chunk in enumerate(
-            retrieved_chunks,
-            start=1,
-        ):
-
-            section = " > ".join(
-
-                heading
-
-                for heading in [
-
-                    chunk.heading_1,
-
-                    chunk.heading_2,
-
-                    chunk.heading_3,
-
-                ]
-
-                if heading
-            )
-
-
-            sources.append({
-
-                "number":
-                    index,
-
-                "score":
-                    round(
-                        chunk.score,
-                        4,
-                    ),
-
-                "source":
-                    chunk.source,
-
-                "section":
-                    section,
-
-                "text":
-                    chunk.text,
-            })
-
-
-        # ====================================================
-        # 6. TOTAL TIMING
-        # ====================================================
-
-        total_ms = (
-
-            time.perf_counter()
-            - total_started
-
-        ) * 1000
-
-
-        # ====================================================
-        # 7. RESULT
-        # ====================================================
-
-        result = {
-
-            "question":
-                question,
-
-            "answer":
-                generation_result[
-                    "answer"
-                ],
-
-            "generation_provider":
-                generation_result[
-                    "provider"
-                ],
-
-            "generation_model":
-                generation_result[
-                    "model"
-                ],
-
-            "sources":
-                sources,
-
-            "cache_hit":
-                False,
-
-            "timings": {
-
-                "cache_lookup_ms":
-                    round(
-                        cache_lookup_ms,
-                        2,
-                    ),
-
-                "retrieval_ms":
-                    round(
-                        retrieval_ms,
-                        2,
-                    ),
-
-                "context_ms":
-                    round(
-                        context_ms,
-                        2,
-                    ),
-
-                "generation_ms":
-                    round(
-                        generation_ms,
-                        2,
-                    ),
-
-                "total_ms":
-                    round(
-                        total_ms,
-                        2,
-                    ),
-            },
-        }
-
-
-        # ====================================================
-        # 8. CACHE SUCCESSFUL RESPONSE
-        # ====================================================
-
-        self.cache.set(
-
-            key=
-                cache_key,
-
-            value=
-                result,
-        )
-
-
-        # ====================================================
-        # 9. OBSERVABILITY LOG
-        # ====================================================
-
-        logger.info(
-            "RAG_TIMING | "
-            "provider=%s | "
-            "model=%s | "
-            "cache_hit=false | "
-            "retrieval_ms=%.2f | "
-            "context_ms=%.2f | "
-            "generation_ms=%.2f | "
-            "total_ms=%.2f",
-            result[
-                "generation_provider"
-            ],
-            result[
-                "generation_model"
-            ],
-            retrieval_ms,
-            context_ms,
-            generation_ms,
-            total_ms,
-        )
-
-
-        return result
-
+            raise
 
 model_circuit_breaker = (
     ModelCircuitBreaker()
 )
+
+
+
+
+# ============================================================
+# RUNTIME METRICS
+# ============================================================
+
+class RuntimeMetrics:
+
+    """
+    Lightweight process-local metrics.
+
+    No Prometheus/Redis/Datadog dependency yet.
+
+    Tracks:
+
+    - RAG requests
+    - cache performance
+    - provider usage
+    - fallbacks
+    - errors
+    - latency
+    """
+
+    def __init__(self):
+
+        self._lock = (
+            threading.Lock()
+        )
+
+        self.started_at = (
+            time.time()
+        )
+
+        self.total_requests = 0
+
+        self.cache_hits = 0
+
+        self.cache_misses = 0
+
+        self.gemini_generations = 0
+
+        self.groq_generations = 0
+
+        self.fallbacks = 0
+
+        self.errors = 0
+
+        self.total_latency_ms = 0.0
+
+
+    def record_success(
+        self,
+        cache_hit: bool,
+        provider: Optional[str],
+        latency_ms: float,
+    ):
+
+        with self._lock:
+
+            self.total_requests += 1
+
+            self.total_latency_ms += (
+                latency_ms
+            )
+
+
+            if cache_hit:
+
+                self.cache_hits += 1
+
+            else:
+
+                self.cache_misses += 1
+
+
+            if provider == "gemini":
+
+                self.gemini_generations += 1
+
+
+            elif provider == "groq":
+
+                self.groq_generations += 1
+
+                # Groq is our cross-provider fallback.
+
+                self.fallbacks += 1
+
+
+    def record_error(self):
+
+        with self._lock:
+
+            self.total_requests += 1
+
+            self.errors += 1
+
+
+    def snapshot(
+        self,
+        cache_size: int,
+    ) -> Dict[str, Any]:
+
+        with self._lock:
+
+            requests = (
+                self.total_requests
+            )
+
+
+            cache_requests = (
+
+                self.cache_hits
+                + self.cache_misses
+            )
+
+
+            cache_hit_rate = (
+
+                self.cache_hits
+                / cache_requests
+
+                if cache_requests
+
+                else 0.0
+            )
+
+
+            average_latency = (
+
+                self.total_latency_ms
+                / requests
+
+                if requests
+
+                else 0.0
+            )
+
+
+            return {
+
+                "uptime_seconds":
+                    round(
+                        time.time()
+                        - self.started_at,
+                        2,
+                    ),
+
+                "requests": {
+
+                    "total":
+                        requests,
+
+                    "errors":
+                        self.errors,
+                },
+
+                "cache": {
+
+                    "hits":
+                        self.cache_hits,
+
+                    "misses":
+                        self.cache_misses,
+
+                    "hit_rate":
+                        round(
+                            cache_hit_rate,
+                            4,
+                        ),
+
+                    "entries":
+                        cache_size,
+
+                    "ttl_seconds":
+                        CACHE_TTL_SECONDS,
+                },
+
+                "generation": {
+
+                    "gemini":
+                        self.gemini_generations,
+
+                    "groq":
+                        self.groq_generations,
+
+                    "provider_fallbacks":
+                        self.fallbacks,
+                },
+
+                "latency": {
+
+                    "average_ms":
+                        round(
+                            average_latency,
+                            2,
+                        )
+                },
+
+                "knowledge_base": {
+
+                    "collection":
+                        COLLECTION_NAME,
+
+                    "version":
+                        KNOWLEDGE_BASE_VERSION,
+                },
+            }
+
+
+# ============================================================
+# SHARED RUNTIME METRICS
+# ============================================================
+
+runtime_metrics = (
+    RuntimeMetrics()
+)
+
+
 
 
 # ============================================================
@@ -2512,6 +2924,9 @@ def create_rag() -> EnterpriseRAG:
 
         generator=
             generation_router,
+
+        metrics=
+            runtime_metrics,
     )
 
 

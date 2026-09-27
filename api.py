@@ -258,6 +258,19 @@ class AskRequest(BaseModel):
         ),
     )
 
+    role: str = Field(
+
+        default="employee",
+
+        pattern=
+            "^(employee|manager|hr)$",
+
+        description=(
+            "Simulated access role for "
+            "authorization-aware retrieval."
+        ),
+    )
+
 
 class RetrievalRequest(BaseModel):
 
@@ -274,6 +287,11 @@ class RetrievalRequest(BaseModel):
         default=DEFAULT_TOP_K,
         ge=3,
         le=MAX_TOP_K,
+    )
+
+    role: str = Field(
+        default="employee",
+        pattern="^(employee|manager|hr)$",
     )
 
 
@@ -310,6 +328,10 @@ class AskResponse(BaseModel):
     request_id: str
 
     question: str
+
+    role: str
+
+    knowledge_base_version: str
 
     answer: str
 
@@ -565,6 +587,26 @@ def developer_console():
     )
 
 
+
+# ============================================================
+# RUNTIME METRICS
+# ============================================================
+
+@app.get(
+    "/metrics",
+    tags=["System"],
+)
+def metrics():
+
+    require_rag()
+
+
+    return rag.metrics.snapshot(
+
+        cache_size=
+            rag.cache.size()
+    )
+
 # ============================================================
 # HEALTH
 # ============================================================
@@ -758,9 +800,14 @@ def ask_policy(
 
         result = rag.ask(
 
-            question=question,
+            question=
+                question,
 
-            top_k=payload.top_k,
+            top_k=
+                payload.top_k,
+
+            role=
+                payload.role,
         )
 
 
@@ -920,6 +967,18 @@ def ask_policy(
         answer=
             result["answer"],
 
+        role=
+            result.get(
+                "role",
+                payload.role,
+            ),
+
+        knowledge_base_version=
+            result.get(
+                "knowledge_base_version",
+                "unknown",
+            ),
+
         generation_provider=
             provider,
 
@@ -1004,6 +1063,8 @@ def retrieve_policy_chunks(
                 question=question,
 
                 top_k=payload.top_k,
+
+                role=payload.role,
             )
         )
 

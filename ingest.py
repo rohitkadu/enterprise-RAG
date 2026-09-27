@@ -93,6 +93,7 @@ from qdrant_client.models import (
     Distance,
     PointStruct,
     VectorParams,
+    PayloadSchemaTyoe
 )
 
 
@@ -2068,6 +2069,30 @@ def recreate_v2_collection(
             ),
     )
 
+# ============================================================
+# PAYLOAD INDEXES
+# ============================================================
+
+# Required for role-aware retrieval.
+#
+# Qdrant uses this keyword index when filtering:
+#
+# access_roles contains "employee"
+# access_roles contains "manager"
+# access_roles contains "hr"
+
+    qdrant_client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="access_roles",
+        field_schema=PayloadSchemaType.KEYWORD,
+        wait=True,
+    )
+
+    logger.info(
+        "Created payload index | "
+        "field=access_roles | "
+        "type=keyword"
+    )
 
 # ============================================================
 # QDRANT UPLOAD
@@ -2160,6 +2185,16 @@ def upload_to_qdrant(
             "subsection":
                 chunk.subsection,
 
+
+            # ============================================================
+            # ACCESS CONTROL
+            # ============================================================
+
+            "access_roles": [
+                "employee",
+                "manager",
+                "hr",
+            ],
 
             # =================================================
             # COMPATIBILITY WITH EXISTING rag.py
