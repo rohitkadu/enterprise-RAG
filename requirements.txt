@@ -1,3 +1,5 @@
+fastapi
+uvicorn[standard]
 google-genai
 qdrant-client
 python-dotenv
